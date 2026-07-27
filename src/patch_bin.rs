@@ -115,37 +115,45 @@ fn logical_lib_name(name: &str) -> Option<String> {
     if name.starts_with("ld-") || name.starts_with("ld-linux") || name.starts_with("ld-musl") {
         return Some("ld".to_string());
     }
-    // Match "libc.so.6", "libc-2.31.so", etc. but NOT "libcrypto", "libcap", ...
-    if name.starts_with("libc.") || name.starts_with("libc-") {
-        return Some("libc".to_string());
-    }
-    if !name.starts_with("lib") {
-        return None;
-    }
 
-    let rest = &name[3..];
+    // Accept every conventional shared-object name, including DT_NEEDED
+    // entries without a "lib" prefix (for example "plugin.so"). The short
+    // logical name leaves room for the "./" prefix required by manual mode.
+    let stem = if let Some(stem) = name.strip_suffix(".so") {
+        stem
+    } else {
+        let pos = name.find(".so.")?;
+        &name[..pos]
+    };
 
-    // Try versioned-name pattern first (e.g. libm-2.31.so -> libm)
-    if let Some(pos) = rest.find('-') {
-        let base = &rest[..pos];
-        if is_valid_logical_lib_base(base) && rest[pos..].contains(".so") {
-            return Some(format!("lib{}", base));
-        }
-    }
+    // Older runtime packages use names such as libm-2.31.so. Normalize a
+    // trailing numeric version so it matches the libm.so.6 DT_NEEDED entry.
+    let logical = stem
+        .rsplit_once('-')
+        .filter(|(_, suffix)| {
+            !suffix.is_empty()
+                && suffix.starts_with(|ch: char| ch.is_ascii_digit())
+                && suffix
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '.' || ch == '_')
+        })
+        .map(|(base, _)| base)
+        .unwrap_or(stem);
 
-    // Fall back to standard .so pattern (e.g. libm.so.6 -> libm)
-    if let Some(pos) = rest.find(".so") {
-        let base = &rest[..pos];
-        if is_valid_logical_lib_base(base) {
-            return Some(format!("lib{}", base));
-        }
+    if is_valid_logical_lib_base(logical) {
+        return Some(logical.to_string());
     }
 
     None
 }
 
 fn is_valid_logical_lib_base(base: &str) -> bool {
-    base.chars().any(|ch| ch.is_ascii_alphanumeric())
+    !base.is_empty()
+        && base != "."
+        && base != ".."
+        && !base.ends_with('-')
+        && !base.contains('/')
+        && base.chars().any(|ch| ch.is_ascii_alphanumeric())
 }
 
 fn manual_needed_replacement(logical_name: &str) -> String {
@@ -561,10 +569,20 @@ mod tests {
     }
 
     #[test]
-    fn logical_lib_name_rejects_unsupported_names() {
-        assert_eq!(logical_lib_name("notlib.so.1"), None);
+    fn logical_lib_name_handles_dt_needed_names_without_lib_prefix() {
+        assert_eq!(logical_lib_name("plugin.so").as_deref(), Some("plugin"));
+        assert_eq!(
+            logical_lib_name("custom-engine.so.2").as_deref(),
+            Some("custom-engine")
+        );
+        assert_eq!(logical_lib_name("notlib.so.1").as_deref(), Some("notlib"));
+    }
+
+    #[test]
+    fn logical_lib_name_rejects_non_shared_object_names() {
         assert_eq!(logical_lib_name("libbroken"), None);
         assert_eq!(logical_lib_name("lib-.so"), None);
+        assert_eq!(logical_lib_name("plugin.something"), None);
     }
 
     #[test]

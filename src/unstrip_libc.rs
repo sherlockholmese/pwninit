@@ -1,7 +1,6 @@
 use crate::debian_libc;
 use crate::elf;
 use crate::http_retry::{self, RetryPolicy, Sleeper, StdSleeper};
-use crate::is_glibc_runtime_shared_object;
 use crate::libc_deb;
 use crate::libc_version::LibcVersion;
 use crate::opts::DebugSource;
@@ -62,10 +61,10 @@ pub enum Error {
     #[snafu(display("failed writing symbols to libc file: {}", source))]
     LibcWrite { source: std::io::Error },
 
-    #[snafu(display("failed scanning for related libc shared objects: {}", source))]
+    #[snafu(display("failed scanning for local shared objects: {}", source))]
     ScanLibraries { source: std::io::Error },
 
-    #[snafu(display("failed unstripping one or more libc shared objects: {}", errors))]
+    #[snafu(display("failed unstripping one or more local shared objects: {}", errors))]
     SharedObjectsFailed { errors: String },
 }
 
@@ -284,7 +283,6 @@ fn write_debuginfod_file_with(
         base_url.trim_end_matches('/'),
         build_id
     );
-    output::progress(url.green().bold());
     let (bytes, _) = http_retry::get_bytes(&url, policy, sleeper).map_err(|err| err.to_string())?;
     if bytes.is_empty() {
         return Err("debuginfod returned an empty response".to_string());
@@ -383,12 +381,16 @@ pub fn unstrip_libc(libc: &Path, ver: &LibcVersion) -> Result {
     Ok(())
 }
 
-/// Find glibc runtime shared objects next to the selected libc.
+fn is_shared_object_name(name: &str) -> bool {
+    name.ends_with(".so") || name.contains(".so.")
+}
+
+/// Find every ELF shared object next to the selected libc.
 ///
 /// The selected libc is always first. Symlink aliases and hard links are
 /// deduplicated by their canonical path so the same file is not rewritten
 /// more than once.
-fn related_libc_shared_objects(libc: &Path) -> Result<Vec<PathBuf>> {
+fn local_shared_objects(libc: &Path) -> Result<Vec<PathBuf>> {
     let parent = libc
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -410,7 +412,7 @@ fn related_libc_shared_objects(libc: &Path) -> Result<Vec<PathBuf>> {
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if !is_glibc_runtime_shared_object(name) {
+        if !is_shared_object_name(name) {
             continue;
         }
         if !matches!(elf::detect::is_elf(&path), Ok(true)) {
@@ -426,7 +428,7 @@ fn related_libc_shared_objects(libc: &Path) -> Result<Vec<PathBuf>> {
     Ok(targets)
 }
 
-/// Unstrip libc and every related glibc shared object using the selected debug
+/// Unstrip libc and every local ELF shared object using the selected debug
 /// symbol repository. Failures are collected after all candidates have been
 /// attempted, so one missing debug entry does not prevent the other libraries
 /// from being processed.
@@ -435,7 +437,7 @@ pub fn unstrip_libc_shared_objects_from_source(
     ver: &LibcVersion,
     source: DebugSource,
 ) -> Result {
-    let targets = related_libc_shared_objects(libc)?;
+    let targets = local_shared_objects(libc)?;
     let mut sources = None;
     unstrip_each_shared_object(targets, |target| {
         match elf::has_debug_syms(target).context(ElfParseSnafu) {
@@ -524,7 +526,7 @@ mod tests {
     }
 
     #[test]
-    fn related_shared_objects_include_glibc_libraries_but_not_unrelated_elfs() {
+    fn local_shared_objects_include_every_elf_so() {
         let tmp = tempfile::TempDir::new().expect("tmpdir");
         let libc = tmp.path().join("libc.so.6");
         copy_elf(&libc);
@@ -533,15 +535,16 @@ mod tests {
             "libpthread-2.31.so",
             "libnss_dns.so.2",
             "libmvec.so.1",
+            "libcrypto.so.3",
+            "libstdc++.so.6",
+            "ld-linux-x86-64.so.2",
         ] {
             copy_elf(&tmp.path().join(name));
         }
-        for name in ["libcrypto.so.3", "libstdc++.so.6", "ld-linux-x86-64.so.2"] {
-            copy_elf(&tmp.path().join(name));
-        }
         std::fs::write(tmp.path().join("librt.so.1"), b"not an ELF").expect("write non-ELF decoy");
+        copy_elf(&tmp.path().join("challenge"));
 
-        let targets = related_libc_shared_objects(&libc).expect("discover related libraries");
+        let targets = local_shared_objects(&libc).expect("discover local shared objects");
         let names: Vec<_> = targets
             .iter()
             .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
@@ -551,10 +554,13 @@ mod tests {
         assert_eq!(
             names[1..],
             [
+                "ld-linux-x86-64.so.2",
+                "libcrypto.so.3",
                 "libm.so.6",
                 "libmvec.so.1",
                 "libnss_dns.so.2",
                 "libpthread-2.31.so",
+                "libstdc++.so.6",
             ]
         );
     }
@@ -570,7 +576,7 @@ mod tests {
         let libc = tmp.path().join("libc.so.6");
         symlink("libc-2.31.so", &libc).expect("create libc symlink");
 
-        let targets = related_libc_shared_objects(&libc).expect("discover related libraries");
+        let targets = local_shared_objects(&libc).expect("discover local shared objects");
         assert_eq!(targets, [libc]);
     }
 

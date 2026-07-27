@@ -1,13 +1,16 @@
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use colored::Colorize;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use serde_json::json;
 
 static QUIET: AtomicBool = AtomicBool::new(false);
 static JSON: AtomicBool = AtomicBool::new(false);
 static VERBOSE: AtomicU8 = AtomicU8::new(0);
 static WARNINGS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+static DOWNLOADS: OnceLock<MultiProgress> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub enum StepStatus {
@@ -107,6 +110,50 @@ pub fn is_json() -> bool {
     JSON.load(Ordering::Relaxed)
 }
 
+fn downloads() -> &'static MultiProgress {
+    DOWNLOADS.get_or_init(MultiProgress::new)
+}
+
+fn download_label(url: &str) -> &str {
+    url.split('?')
+        .next()
+        .unwrap_or(url)
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|label| !label.is_empty())
+        .unwrap_or("download")
+}
+
+pub fn download_progress(url: &str, total: Option<u64>) -> ProgressBar {
+    if QUIET.load(Ordering::Relaxed) || is_json() {
+        return ProgressBar::hidden();
+    }
+
+    let label = format!("downloading {}", download_label(url));
+    let bar = match total {
+        Some(total) => ProgressBar::new(total).with_style(
+            ProgressStyle::with_template(
+                "{msg:.green} [{bar:30.cyan/blue}] {bytes}/{total_bytes} {bytes_per_sec}",
+            )
+            .expect("valid download progress template")
+            .progress_chars("=>-"),
+        ),
+        None => {
+            let bar = ProgressBar::new_spinner().with_style(
+                ProgressStyle::with_template(
+                    "{spinner:.green} {msg:.green} {bytes} {bytes_per_sec}",
+                )
+                .expect("valid download spinner template"),
+            );
+            bar.enable_steady_tick(Duration::from_millis(100));
+            bar
+        }
+    };
+    bar.set_message(label);
+    downloads().add(bar)
+}
+
 pub fn progress(message: impl std::fmt::Display) {
     if !QUIET.load(Ordering::Relaxed) && !is_json() {
         println!("{message}");
@@ -198,5 +245,19 @@ pub fn render_summary(summary: &Summary) {
             .filter(|step| matches!(step.status, StepStatus::Failed))
             .count();
         println!("completed: {completed}, skipped: {skipped}, failed: {failed}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::download_label;
+
+    #[test]
+    fn download_label_uses_the_last_url_path_segment() {
+        assert_eq!(
+            download_label("https://example.com/pool/libc6.deb?download=1"),
+            "libc6.deb"
+        );
+        assert_eq!(download_label("https://example.com/pool/glibc/"), "glibc");
     }
 }

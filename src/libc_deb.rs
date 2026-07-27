@@ -131,7 +131,6 @@ pub(crate) fn write_deb_url_file_with<P: AsRef<Path>>(
     sleeper: &mut dyn Sleeper,
 ) -> Result<()> {
     let out_path = out_path.as_ref();
-    output::progress(url.green().bold());
 
     let deb_bytes = match http_retry::get_bytes(&url, policy, sleeper) {
         Ok((bytes, _trace)) => bytes,

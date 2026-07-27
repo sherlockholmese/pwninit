@@ -85,7 +85,7 @@ If the automatic detection is incorrect, you can manually specify the file paths
 pwninit pwn --bin ./challenge_bin --libc ./libc.so.6 --ld ./ld-linux.so.2
 ```
 
-During pwn initialization, debug symbols are selected automatically based on the detected glibc package. Override the repository when needed with `--debug-source`:
+During pwn initialization, debug symbols are selected automatically based on the detected glibc package and expanded for every local ELF `.so` file. Override the repository when needed with `--debug-source`:
 
 ```sh
 pwninit pwn --debug-source launchpad
@@ -180,7 +180,7 @@ pwninit pwn --patch-mode manual
 pwninit pwn --patch-mode none
 ```
 
-The default `patchelf` mode sets the `RPATH` to `.` whenever local shared libraries are present and sets the interpreter to `./ld`. Manual mode rewrites each matching `DT_NEEDED` entry to a short local alias such as `./libm` and rewrites `PT_INTERP` to `./ld`. This applies to downloaded companions such as `libm.so.6`, `libpthread.so.0`, and `libnss_*.so.2`, not only libc.
+The default `patchelf` mode sets the `RPATH` to `.` whenever local shared libraries are present and sets the interpreter to `./ld`. Manual mode rewrites every `DT_NEEDED` entry with a matching local `.so` file to a short local alias such as `./libm` or `./plugin` and rewrites `PT_INTERP` to `./ld`. Shared-object names do not need a `lib` prefix.
 
 Both active modes create the necessary symlinks. Manual replacements must fit within the original ELF string slot; oversized or unresolved entries are skipped with a warning. The deprecated `--no-patchelf` and `--no-patch-bin` options remain available as compatibility aliases.
 

@@ -25,13 +25,17 @@
 #![allow(dead_code)]
 
 use std::borrow::Cow;
+use std::io::{self, Write};
 use std::thread;
 use std::time::Duration;
 
+use indicatif::ProgressBar;
 use reqwest::blocking::Client;
 use reqwest::Method;
 use serde::de::DeserializeOwned;
 use snafu::Snafu;
+
+use crate::output;
 
 /// Return `true` for HTTP statuses that are safe to retry: `408`,
 /// `429`, and any `5xx`.
@@ -204,6 +208,37 @@ fn transfer_client() -> Result<Client> {
         .map_err(|source| Error::Request { source })
 }
 
+struct ProgressWriter {
+    bytes: Vec<u8>,
+    progress: ProgressBar,
+}
+
+impl Write for ProgressWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.bytes.extend_from_slice(buf);
+        self.progress.inc(buf.len() as u64);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn read_response_body(
+    mut response: reqwest::blocking::Response,
+    url: &str,
+) -> reqwest::Result<Vec<u8>> {
+    let progress = output::download_progress(url, response.content_length());
+    let mut writer = ProgressWriter {
+        bytes: Vec::new(),
+        progress,
+    };
+    let result = response.copy_to(&mut writer);
+    writer.progress.finish_and_clear();
+    result.map(|_| writer.bytes)
+}
+
 fn request_bytes(
     method: Method,
     url: &str,
@@ -231,13 +266,8 @@ fn request_bytes(
 
         let status = resp.status();
         if status.is_success() {
-            match resp.bytes() {
-                Ok(bytes) => RetryOutcome::Success(bytes.to_vec()),
-                // `resp.bytes()` in reqwest 0.13.2 wraps every error as
-                // `Kind::Decode` (via `crate::error::decode`), including
-                // body read failures like truncated bodies and connection
-                // drops. All such errors are body read errors, so we
-                // retry them as transient failures.
+            match read_response_body(resp, url) {
+                Ok(bytes) => RetryOutcome::Success(bytes),
                 Err(source) => RetryOutcome::Transient(Error::Request { source }),
             }
         } else if is_retryable_status(status) {
@@ -290,46 +320,12 @@ pub fn get_json<T>(
 where
     T: DeserializeOwned,
 {
-    let client = transfer_client()?;
-    retry_with_policy(policy, sleeper, || -> RetryOutcome<T> {
-        let resp = match client.get(url).send() {
-            Ok(resp) => resp,
-            Err(source) => {
-                return if is_retryable_error(&source) {
-                    RetryOutcome::Transient(Error::Request { source })
-                } else {
-                    RetryOutcome::Permanent(Error::Request { source })
-                };
-            }
-        };
-
-        let status = resp.status();
-        if status.is_success() {
-            // Read the full body first so a truncated body (which reqwest
-            // classifies as `Decode` from the `bytes()` call) is a
-            // transient retryable error, distinct from a complete body
-            // that fails to parse as JSON.
-            let bytes = match resp.bytes() {
-                Ok(bytes) => bytes,
-                // `resp.bytes()` in reqwest 0.13.2 wraps every error as
-                // `Kind::Decode` (via `crate::error::decode`), including
-                // body read failures like truncated bodies and connection
-                // drops. All such errors are body read errors, so we
-                // retry them as transient failures.
-                Err(source) => return RetryOutcome::Transient(Error::Request { source }),
-            };
-            match serde_json::from_slice::<T>(&bytes) {
-                Ok(value) => RetryOutcome::Success(value),
-                Err(source) => RetryOutcome::Permanent(Error::Parse {
-                    message: source.to_string(),
-                }),
-            }
-        } else if is_retryable_status(status) {
-            RetryOutcome::Transient(Error::RetryableStatus { status })
-        } else {
-            RetryOutcome::Permanent(Error::PermanentStatus { status })
-        }
-    })
+    let (bytes, trace) = request_bytes(Method::GET, url, None, policy, sleeper)?;
+    serde_json::from_slice::<T>(&bytes)
+        .map(|value| (value, trace))
+        .map_err(|source| Error::Parse {
+            message: source.to_string(),
+        })
 }
 
 #[cfg(test)]
@@ -571,5 +567,19 @@ mod tests {
         let mut sleeper = RecordingSleeper::default();
         sleeper.sleep(Duration::from_secs(3600));
         assert_eq!(sleeper.sleeps, vec![Duration::from_secs(3600)]);
+    }
+
+    #[test]
+    fn progress_writer_tracks_downloaded_bytes() {
+        let progress = ProgressBar::hidden();
+        let mut writer = ProgressWriter {
+            bytes: Vec::new(),
+            progress: progress.clone(),
+        };
+
+        writer.write_all(b"downloaded bytes").expect("write bytes");
+
+        assert_eq!(writer.bytes, b"downloaded bytes");
+        assert_eq!(progress.position(), 16);
     }
 }
