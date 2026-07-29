@@ -6,6 +6,11 @@ use crate::libc_version::LibcVersion;
 use crate::opts::DebugSource;
 use crate::output;
 
+use colored::Colorize;
+use ex::fs::File;
+use ex::io;
+use snafu::ResultExt;
+use snafu::Snafu;
 use std::collections::HashSet;
 use std::io::copy;
 use std::io::stderr;
@@ -15,14 +20,6 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::ExitStatus;
-use std::sync::mpsc;
-use std::thread;
-
-use colored::Colorize;
-use ex::fs::File;
-use ex::io;
-use snafu::ResultExt;
-use snafu::Snafu;
 use tempfile::TempDir;
 
 const DEBIAN_DEBUGINFOD_URL: &str = "https://debuginfod.debian.net";
@@ -283,6 +280,11 @@ fn write_debuginfod_file_with(
         base_url.trim_end_matches('/'),
         build_id
     );
+    output::progress(
+        format!("requesting debug symbols from {}", url)
+            .yellow()
+            .bold(),
+    );
     let (bytes, _) = http_retry::get_bytes(&url, policy, sleeper).map_err(|err| err.to_string())?;
     if bytes.is_empty() {
         return Err("debuginfod returned an empty response".to_string());
@@ -306,70 +308,38 @@ fn fetch_debug_symbols_with_sources(
         });
     }
 
-    let (tx, rx) = mpsc::channel();
-    let mut handles = Vec::new();
-
-    for (idx, source) in sources.into_iter().enumerate() {
-        let tx = tx.clone();
-        let file_names: Vec<String> = file_names.iter().map(|name| (*name).to_string()).collect();
-        let build_id = build_id.to_string();
-        let out_path = tmp_dir.join(format!("libc-syms-{}", idx));
-        let thread_policy = policy;
-        handles.push(thread::spawn(move || {
-            let mut sleeper = StdSleeper;
-            let names: Vec<&str> = file_names.iter().map(String::as_str).collect();
-            let name = source.name().to_string();
-            let result = match source {
-                DebugSymbolSource::DebPackage { url, .. } => libc_deb::write_deb_url_file_with(
-                    &url,
-                    &names,
-                    &out_path,
-                    thread_policy,
-                    &mut sleeper,
-                )
-                .map_err(|err| err.to_string()),
-                DebugSymbolSource::Debuginfod { base_url, .. } => write_debuginfod_file_with(
-                    &base_url,
-                    &build_id,
-                    &out_path,
-                    thread_policy,
-                    &mut sleeper,
-                ),
-            }
-            .map(|()| out_path);
-            let _ = tx.send((name, result));
-        }));
-    }
-    drop(tx);
-
-    let mut winner: Option<(String, PathBuf)> = None;
     let mut errors = Vec::new();
-    for (name, result) in rx {
+    for (idx, source) in sources.into_iter().enumerate() {
+        let out_path = tmp_dir.join(format!("libc-syms-{}", idx));
+        let name = source.name().to_string();
+        let mut sleeper = StdSleeper;
+        let result = match source {
+            DebugSymbolSource::DebPackage { url, .. } => {
+                libc_deb::write_deb_url_file_with(&url, file_names, &out_path, policy, &mut sleeper)
+                    .map_err(|err| err.to_string())
+            }
+            DebugSymbolSource::Debuginfod { base_url, .. } => {
+                write_debuginfod_file_with(&base_url, build_id, &out_path, policy, &mut sleeper)
+            }
+        };
         match result {
-            Ok(path) if winner.is_none() => winner = Some((name, path)),
-            Ok(_) => {}
+            Ok(()) => {
+                std::fs::copy(&out_path, sym_path).context(LibcWriteSnafu)?;
+                output::progress(format!("using debug symbols from {}", name).green().bold());
+                return Ok(());
+            }
             Err(err) => errors.push(format!("{}: {}", name, err)),
         }
     }
 
-    for handle in handles {
-        let _ = handle.join();
-    }
-
-    let Some((name, path)) = winner else {
-        return Err(Error::DebugSourcesFailed {
-            target: target.to_string(),
-            errors: if errors.is_empty() {
-                "all source workers exited without a result".to_string()
-            } else {
-                errors.join("; ")
-            },
-        });
-    };
-
-    std::fs::copy(&path, sym_path).context(LibcWriteSnafu)?;
-    output::progress(format!("using debug symbols from {}", name).green().bold());
-    Ok(())
+    Err(Error::DebugSourcesFailed {
+        target: target.to_string(),
+        errors: if errors.is_empty() {
+            "all debug-symbol sources failed without an error".to_string()
+        } else {
+            errors.join("; ")
+        },
+    })
 }
 
 /// Download debug symbols and apply them to a libc if it doesn't have them
@@ -833,7 +803,7 @@ mod tests {
     }
 
     #[test]
-    fn debug_symbol_fetch_races_launchpad_and_debian_testing_sources() {
+    fn debug_symbol_fetch_falls_back_from_launchpad_to_debian_testing() {
         let deb = make_tiny_deb_gz("libc-2.36.so", b"debian testing debug bytes");
         let launchpad = ScriptedServer::with(vec![ScriptedResponse::status(404, b"missing")]);
         let debian_testing = ScriptedServer::with(vec![ScriptedResponse::Body(deb)]);
@@ -879,6 +849,46 @@ mod tests {
             debian_testing.recorded().len(),
             1,
             "Debian testing source should be attempted"
+        );
+    }
+
+    #[test]
+    fn debug_symbol_fetch_stops_after_the_first_successful_source() {
+        let deb = make_tiny_deb_gz("libc-2.36.so", b"package debug bytes");
+        let package = ScriptedServer::with(vec![ScriptedResponse::Body(deb)]);
+        let unused_fallback = ScriptedServer::with(vec![ScriptedResponse::Body(
+            b"debuginfod debug bytes".to_vec(),
+        )]);
+
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let sym_path = tmp.path().join("libc-syms");
+        let sources = vec![
+            DebugSymbolSource::deb_package(
+                "launchpad",
+                format!("{}/libc6-dbg.deb", package.base_url),
+            ),
+            DebugSymbolSource::debuginfod("ubuntu-debuginfod", &unused_fallback.base_url),
+        ];
+
+        fetch_debug_symbols_with_sources(
+            &["libc-2.36.so"],
+            "0123456789abcdef",
+            "test libc",
+            &sym_path,
+            tmp.path(),
+            sources,
+            fast_policy(),
+        )
+        .expect("the first source should satisfy the debug symbol fetch");
+
+        assert_eq!(
+            std::fs::read(&sym_path).expect("read symbols"),
+            b"package debug bytes"
+        );
+        assert_eq!(package.recorded().len(), 1);
+        assert!(
+            unused_fallback.recorded().is_empty(),
+            "a successful package fetch must not wait for or request fallback sources"
         );
     }
 
