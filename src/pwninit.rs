@@ -1,4 +1,7 @@
 use crate::fetch_libc;
+use crate::kernel;
+use crate::kernel_image;
+use crate::kernel_initramfs;
 use crate::maybe_visit_libc_report;
 use crate::needed_glibc_libraries_result;
 use crate::opts::{self, Command, FetchLibcSource, Opts};
@@ -375,10 +378,293 @@ fn run_pwn_flow(mut pwn_opts: crate::opts::PwnOpts, summary: &mut Summary) {
     }
 }
 
+fn record_kernel_write(
+    summary: &mut Summary,
+    name: &str,
+    path: &std::path::Path,
+    result: kernel::Result<kernel::WriteOutcome>,
+) -> bool {
+    match result {
+        Ok(kernel::WriteOutcome::Written) => {
+            summary.push(Step::completed(name, format!("wrote {}", path.display())));
+            true
+        }
+        Ok(kernel::WriteOutcome::Overwritten) => {
+            summary.push(Step::completed(
+                name,
+                format!("overwrote {}", path.display()),
+            ));
+            true
+        }
+        Ok(kernel::WriteOutcome::SkippedExisting) => {
+            summary.push(Step::skipped(
+                name,
+                format!(
+                    "{} already exists; use --force to overwrite",
+                    path.display()
+                ),
+            ));
+            true
+        }
+        Err(err) => {
+            summary.push(Step::failed(name, err.to_string(), true));
+            false
+        }
+    }
+}
+
+fn run_kernel_flow(kernel_opts: crate::opts::KernelOpts, summary: &mut Summary) {
+    let Some(kernel_path) = kernel_opts.kernel.as_deref() else {
+        summary.push(Step::failed(
+            "inspect kernel image",
+            "kernel path was not resolved",
+            true,
+        ));
+        return;
+    };
+    let kernel_ready = push_required(
+        summary,
+        "inspect kernel image",
+        format!("detected x86-64 kernel image {}", kernel_path.display()),
+        kernel_image::inspect(kernel_path),
+    );
+    if !kernel_ready && !kernel_opts.best_effort {
+        return;
+    }
+
+    let Some(initramfs_path) = kernel_opts.initramfs.as_deref() else {
+        summary.push(Step::failed(
+            "inspect initramfs",
+            "initramfs path was not resolved",
+            true,
+        ));
+        return;
+    };
+    let archive_compression = match kernel_initramfs::detect_file_compression(initramfs_path) {
+        Ok(compression) => {
+            summary.push(Step::completed(
+                "inspect initramfs",
+                format!("detected {} initramfs candidate", compression.name()),
+            ));
+            Some(compression)
+        }
+        Err(err) => {
+            summary.push(Step::failed("inspect initramfs", err.to_string(), true));
+            if !kernel_opts.best_effort {
+                return;
+            }
+            None
+        }
+    };
+
+    let mut rootfs_ready = false;
+    let mut extracted_compression = archive_compression;
+    if archive_compression.is_some() {
+        match kernel::extract_rootfs(&kernel_opts) {
+            Ok(kernel::ExtractOutcome::Extracted(compression)) => {
+                extracted_compression = Some(compression);
+                rootfs_ready = true;
+                summary.push(Step::completed(
+                    "extract initramfs",
+                    format!("wrote {}", kernel_opts.rootfs_dir.display()),
+                ));
+            }
+            Ok(kernel::ExtractOutcome::Replaced(compression)) => {
+                extracted_compression = Some(compression);
+                rootfs_ready = true;
+                summary.push(Step::completed(
+                    "extract initramfs",
+                    format!("replaced {}", kernel_opts.rootfs_dir.display()),
+                ));
+            }
+            Ok(kernel::ExtractOutcome::SkippedExisting(compression)) => {
+                extracted_compression = Some(compression);
+                rootfs_ready = true;
+                summary.push(Step::skipped(
+                    "extract initramfs",
+                    format!(
+                        "{} already exists; use --force to replace",
+                        kernel_opts.rootfs_dir.display()
+                    ),
+                ));
+            }
+            Err(err) => {
+                summary.push(Step::failed("extract initramfs", err.to_string(), true));
+                if !kernel_opts.best_effort {
+                    return;
+                }
+            }
+        }
+    } else {
+        summary.push(Step::skipped(
+            "extract initramfs",
+            "initramfs inspection failed",
+        ));
+    }
+
+    let debug_initramfs_ready = if let Some(path) = kernel_opts.debug_initramfs.as_deref() {
+        let ready = record_kernel_write(
+            summary,
+            "prepare debug initramfs",
+            path,
+            kernel::initialize_debug_initramfs(&kernel_opts),
+        );
+        if !ready && !kernel_opts.best_effort {
+            return;
+        }
+        ready
+    } else {
+        summary.push(Step::failed(
+            "prepare debug initramfs",
+            "debug initramfs path was not resolved",
+            true,
+        ));
+        if !kernel_opts.best_effort {
+            return;
+        }
+        false
+    };
+
+    if kernel_opts.no_export_modules {
+        summary.push(Step::skipped(
+            "export kernel modules",
+            "--no-export-modules was requested",
+        ));
+    } else if !rootfs_ready {
+        summary.push(Step::skipped(
+            "export kernel modules",
+            "initramfs extraction failed",
+        ));
+    } else {
+        match kernel::export_modules(&kernel_opts) {
+            Ok((0, _)) => summary.push(Step::skipped(
+                "export kernel modules",
+                "no .ko files were found",
+            )),
+            Ok((copied, skipped)) => summary.push(Step::completed(
+                "export kernel modules",
+                format!(
+                    "copied {copied} module(s) to {}; preserved {skipped}",
+                    kernel_opts.modules_dir.display()
+                ),
+            )),
+            Err(err) => {
+                summary.push(Step::failed("export kernel modules", err.to_string(), true));
+                if !kernel_opts.best_effort {
+                    return;
+                }
+            }
+        }
+    }
+
+    if kernel_opts.no_vmlinux {
+        summary.push(Step::skipped(
+            "extract vmlinux",
+            "--no-vmlinux was requested",
+        ));
+    } else if !kernel_ready {
+        summary.push(Step::skipped(
+            "extract vmlinux",
+            "kernel image inspection failed",
+        ));
+    } else {
+        let ready = record_kernel_write(
+            summary,
+            "extract vmlinux",
+            &kernel_opts.vmlinux_path,
+            kernel::extract_vmlinux(&kernel_opts),
+        );
+        if !ready && !kernel_opts.best_effort {
+            return;
+        }
+    }
+
+    match kernel::create_placeholder_flags(&kernel_opts) {
+        Ok((0, 0)) => summary.push(Step::skipped(
+            "create local flag",
+            "no missing relative flag disk was referenced",
+        )),
+        Ok((written, skipped)) => summary.push(Step::completed(
+            "create local flag",
+            format!("created {written} placeholder(s); preserved {skipped}"),
+        )),
+        Err(err) => {
+            summary.push(Step::failed("create local flag", err.to_string(), true));
+            if !kernel_opts.best_effort {
+                return;
+            }
+        }
+    }
+
+    if debug_initramfs_ready {
+        let ready = record_kernel_write(
+            summary,
+            "generate debug launcher",
+            &kernel_opts.debug_run_path,
+            kernel::generate_debug_launcher(&kernel_opts),
+        );
+        if !ready && !kernel_opts.best_effort {
+            return;
+        }
+    } else {
+        summary.push(Step::skipped(
+            "generate debug launcher",
+            "debug initramfs preparation failed",
+        ));
+    }
+
+    if kernel_opts.no_template {
+        summary.push(Step::skipped(
+            "generate exploit",
+            "--no-template was requested",
+        ));
+    } else if !rootfs_ready {
+        summary.push(Step::skipped(
+            "generate exploit",
+            "initramfs extraction failed",
+        ));
+    } else {
+        let ready = record_kernel_write(
+            summary,
+            "generate exploit",
+            &kernel_opts.exploit_path,
+            kernel::generate_exploit(&kernel_opts),
+        );
+        if !ready && !kernel_opts.best_effort {
+            return;
+        }
+    }
+
+    if !rootfs_ready {
+        summary.push(Step::skipped(
+            "generate build helper",
+            "initramfs extraction failed",
+        ));
+    } else if !debug_initramfs_ready {
+        summary.push(Step::skipped(
+            "generate build helper",
+            "debug initramfs preparation failed",
+        ));
+    } else if let Some(compression) = extracted_compression {
+        let _ = record_kernel_write(
+            summary,
+            "generate build helper",
+            &kernel_opts.build_path,
+            kernel::generate_build_helper(&kernel_opts, compression),
+        );
+    } else {
+        summary.push(Step::skipped(
+            "generate build helper",
+            "initramfs compression could not be determined",
+        ));
+    }
+}
+
 pub fn run_with_summary(opts: Opts) -> Result<Summary> {
     let mut summary = match &opts.cmd {
         Some(Command::FetchLibc(_)) => Summary::new("fetch-libc"),
         Some(Command::Rev(_)) => Summary::new("rev"),
+        Some(Command::Kernel(_)) => Summary::new("kernel"),
         Some(Command::Pwn(_)) | None => Summary::new("pwn"),
     };
     let opts = match opts.find_if_unspec() {
@@ -396,6 +682,7 @@ pub fn run_with_summary(opts: Opts) -> Result<Summary> {
         match &opts.cmd {
             Some(Command::FetchLibc(_)) => "fetch-libc",
             Some(Command::Rev(_)) => "rev",
+            Some(Command::Kernel(_)) => "kernel",
             Some(Command::Pwn(_)) | None => "pwn",
         }
     ));
@@ -403,6 +690,7 @@ pub fn run_with_summary(opts: Opts) -> Result<Summary> {
     match opts.cmd {
         Some(Command::FetchLibc(fetch_opts)) => run_fetch_libc(fetch_opts, &mut summary)?,
         Some(Command::Rev(rev_opts)) => run_rev_flow(rev_opts, &mut summary),
+        Some(Command::Kernel(kernel_opts)) => run_kernel_flow(kernel_opts, &mut summary),
         Some(Command::Pwn(pwn_opts)) => run_pwn_flow(pwn_opts, &mut summary),
         None => run_pwn_flow(opts.pwn, &mut summary),
     }
@@ -416,5 +704,125 @@ pub fn run(opts: Opts) -> Result {
         Ok(())
     } else {
         Err(Error::Incomplete)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use clap::Parser;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+
+    use super::*;
+    use crate::kernel_initramfs;
+    use crate::opts::KernelOpts;
+
+    fn synthetic_bzimage() -> Vec<u8> {
+        let elf = std::fs::read("/bin/true").expect("read x86-64 ELF fixture");
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&elf).expect("compress ELF fixture");
+        let compressed = encoder.finish().expect("finish compressed ELF");
+
+        let mut image = vec![0; 0x300];
+        image[0x1fe..0x200].copy_from_slice(&[0x55, 0xaa]);
+        image[0x202..0x206].copy_from_slice(b"HdrS");
+        image.extend_from_slice(&compressed);
+        image
+    }
+
+    #[test]
+    fn kernel_flow_creates_development_layout_and_preserves_original_archive() {
+        let workspace = tempfile::TempDir::new().expect("workspace");
+        let source_root = tempfile::TempDir::new().expect("source rootfs");
+        std::fs::create_dir_all(source_root.path().join("etc/init.d"))
+            .expect("create init scripts");
+        std::fs::write(
+            source_root.path().join("etc/init.d/rcS"),
+            "chmod 666 /dev/hackme\n",
+        )
+        .expect("write rcS");
+        std::fs::write(source_root.path().join("hackme.ko"), b"module").expect("write module");
+
+        let initramfs = workspace.path().join("initramfs.cpio.gz");
+        kernel_initramfs::pack(
+            source_root.path(),
+            &initramfs,
+            kernel_initramfs::Compression::Gzip,
+        )
+        .expect("pack initramfs");
+        let original = std::fs::read(&initramfs).expect("read original initramfs");
+
+        let bzimage = workspace.path().join("bzImage");
+        std::fs::write(&bzimage, synthetic_bzimage()).expect("write bzImage");
+        let run_script = workspace.path().join("run.sh");
+        std::fs::write(
+            &run_script,
+            format!(
+                "#!/bin/sh\nqemu-system-x86_64 -kernel {} -initrd {} -append \"console=ttyS0 kaslr kpti=1\"\n",
+                bzimage.display(),
+                initramfs.display()
+            ),
+        )
+        .expect("write run script");
+
+        let debug_initramfs = workspace.path().join("initramfs-debug.cpio.gz");
+        let rootfs = workspace.path().join("initramfs");
+        let modules = workspace.path().join("kernel_modules");
+        let vmlinux = workspace.path().join("vmlinux");
+        let debug_run = workspace.path().join("run-debug.sh");
+        let exploit = workspace.path().join("exploit.c");
+        let build = workspace.path().join("build-exploit.sh");
+        let opts = Opts {
+            pwn: crate::opts::PwnOpts::default(),
+            cmd: Some(Command::Kernel(KernelOpts {
+                kernel: Some(bzimage),
+                initramfs: Some(initramfs.clone()),
+                debug_initramfs: Some(debug_initramfs.clone()),
+                run_script: Some(run_script),
+                rootfs_dir: rootfs.clone(),
+                vmlinux_path: vmlinux.clone(),
+                debug_run_path: debug_run.clone(),
+                exploit_path: exploit.clone(),
+                build_path: build.clone(),
+                modules_dir: modules.clone(),
+                ..KernelOpts::default()
+            })),
+            quiet: false,
+            verbose: 0,
+            json: false,
+        };
+
+        let summary = run_with_summary(opts).expect("run kernel flow");
+        assert!(summary.success(), "{:?}", summary.steps);
+        assert_eq!(
+            std::fs::read(&initramfs).expect("read preserved initramfs"),
+            original
+        );
+        assert_eq!(
+            std::fs::read(&debug_initramfs).expect("read debug initramfs"),
+            original
+        );
+        assert!(rootfs.join("hackme.ko").is_file());
+        assert!(modules.join("hackme.ko").is_file());
+        assert!(vmlinux.is_file());
+        assert!(debug_run.is_file());
+        assert!(exploit.is_file());
+        assert!(build.is_file());
+    }
+
+    #[test]
+    fn clap_kernel_command_does_not_require_userspace_binary() {
+        let opts = Opts::try_parse_from([
+            "pwninit",
+            "kernel",
+            "--kernel",
+            "bzImage",
+            "--initramfs",
+            "initramfs.cpio.gz",
+        ])
+        .expect("kernel CLI should parse independently");
+        assert!(matches!(opts.cmd, Some(Command::Kernel(_))));
     }
 }

@@ -4,7 +4,7 @@
 [![Crates.io](https://img.shields.io/crates/v/pwninit)](https://crates.io/crates/pwninit)
 [![Docs.rs](https://docs.rs/pwninit/badge.svg)](https://docs.rs/pwninit)
 
-A tool for automating starting binary exploit challenges, as well as reverse engineering ones.
+A tool for automating userspace and Linux kernel exploit challenges, as well as reverse engineering ones.
 
 ## Table of Contents
 
@@ -13,6 +13,7 @@ A tool for automating starting binary exploit challenges, as well as reverse eng
 - [Features](#features)
 - [Usage](#usage)
   - [Pwn Challenges](#pwn-challenges)
+  - [Kernel Pwn Challenges](#kernel-pwn-challenges)
   - [Reverse Engineering Challenges](#reverse-engineering-challenges)
   - [Fetching Additional Libraries](#fetching-additional-libraries)
 - [Advanced Configuration](#advanced-configuration)
@@ -63,6 +64,7 @@ hunter	hunter_patched	ld-2.23.so  libc.so.6  readme  solve.py
 - Downloads a matching linker (`ld-linux.so.*`) to segfaultlessly load the provided libc.
 - Fetches debug symbols and unstrips libc plus related glibc shared libraries in the challenge directory automatically.
 - Patches binaries using `patchelf` (or natively) to set the correct `RPATH` and `PT_INTERP`.
+- Unpacks kernel initramfs archives, extracts `vmlinux`, exports kernel modules, and generates a no-mitigation QEMU development setup.
 - Downloads additional libraries from the same libc package on demand.
 - Generates template solve scripts for both `pwntools` and `angr` / `z3`.
 - Supports creating local `uv` virtual environments (`.venv`) for python dependencies.
@@ -99,6 +101,69 @@ build ID.
 Use `--no-unstrip` to skip downloading debug symbols entirely. The standalone `fetch-libc` command only downloads packaged runtime files and does not unstrip them.
 
 The command fails before changing files when no binary is found. If multiple candidate binaries, libcs, or linkers are present, specify the intended path explicitly instead of relying on directory order.
+
+### Kernel Pwn Challenges
+
+Run the `kernel` subcommand in a directory containing an x86-64 `vmlinuz` or
+`bzImage` and an initramfs:
+
+```sh
+pwninit kernel
+```
+
+The kernel workflow detects the challenge files and creates a development
+layout without modifying the supplied kernel, initramfs, or QEMU launcher:
+
+```text
+vmlinuz                       original kernel image
+initramfs.cpio.gz             original initramfs, never rewritten
+initramfs-debug.cpio.gz       writable debug initramfs
+initramfs/                    unpacked root filesystem
+kernel_modules/               exported .ko files for analysis
+vmlinux                       extracted x86-64 kernel ELF
+run-debug.sh                  QEMU launcher with mitigations disabled
+exploit.c                     static C exploit template
+build-exploit.sh              compile and repack helper
+```
+
+`run-debug.sh` preserves the challenge's QEMU options where possible, switches
+the initrd to the debug archive, and adds `nokaslr nopti nosmep nosmap`. Start
+QEMU paused with a GDB server by setting `GDB=1`:
+
+```sh
+./run-debug.sh
+GDB=1 ./run-debug.sh
+```
+
+Build the generated Intel-syntax exploit and repack only the debug initramfs:
+
+```sh
+./build-exploit.sh
+```
+
+The helper defaults to `gcc -static -O2 -masm=intel`. Override `CC`, `CFLAGS`,
+or `EXPLOIT_NAME` through the environment. It requires `cpio` and the
+compressor used by the original archive.
+
+Plain newc CPIO and gzip, xz, legacy lzma, bzip2, zstd, modern lz4, and legacy
+lz4 compression are supported. Existing generated files are preserved unless
+`--force` is supplied. Kernel modules are copied into `kernel_modules/`, rather
+than into the challenge root.
+
+Specify ambiguous or non-standard paths explicitly:
+
+```sh
+pwninit kernel \
+    --kernel ./bzImage \
+    --initramfs ./rootfs.cpio.xz \
+    --debug-initramfs ./rootfs-debug.cpio.xz \
+    --run-script ./start.sh
+```
+
+Use `--no-template`, `--no-vmlinux`, or `--no-export-modules` to skip optional
+artifacts. Output locations can be changed with `--rootfs-dir`,
+`--vmlinux-path`, `--debug-run-path`, `--exploit-path`, `--build-path`, and
+`--modules-dir`.
 
 ### Reverse Engineering Challenges
 

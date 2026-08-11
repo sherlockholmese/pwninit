@@ -9,10 +9,10 @@ use colored::Colorize;
 use ex::fs::File;
 use ex::io;
 use flate2::read::GzDecoder;
-use lzma::LzmaReader;
 use snafu::OptionExt;
 use snafu::ResultExt;
 use snafu::Snafu;
+use xz2::read::XzDecoder;
 
 use crate::http_retry::{self, RetryPolicy, Sleeper, StdSleeper};
 use crate::output;
@@ -54,9 +54,6 @@ pub enum Error {
         status
     ))]
     DownloadStatus { status: reqwest::StatusCode },
-
-    #[snafu(display("failed decompressing data.tar.xz: {}", source))]
-    DataUnzipLzma { source: lzma::LzmaError },
 
     #[snafu(display("failed decompressing data.tar.zst: {}", source))]
     DataUnzipZstd { source: std::io::Error },
@@ -169,7 +166,7 @@ pub(crate) fn write_deb_url_file_with<P: AsRef<Path>>(
                 write_ubuntu_data_tar_file(data, file_names, out_path)
             }
             b"xz" => {
-                let data = LzmaReader::new_decompressor(entry).context(DataUnzipLzmaSnafu)?;
+                let data = XzDecoder::new(entry);
                 write_ubuntu_data_tar_file(data, file_names, out_path)
             }
             b"zst" => {

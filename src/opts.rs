@@ -5,8 +5,11 @@ use crate::elf;
 use crate::is_bin;
 use crate::is_ld;
 use crate::is_libc;
+use crate::kernel_image;
+use crate::kernel_initramfs;
 use crate::output;
 
+use std::ffi::OsStr;
 use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -90,6 +93,31 @@ pub enum Error {
         "no challenge binary found; use --bin PATH or run from the challenge directory"
     ))]
     MissingBinary,
+
+    #[snafu(display(
+        "no x86-64 kernel image or bzImage found; use --kernel PATH or run from the challenge directory"
+    ))]
+    MissingKernel,
+
+    #[snafu(display(
+        "no initramfs archive found; use --initramfs PATH or run from the challenge directory"
+    ))]
+    MissingInitramfs,
+
+    #[snafu(display("debug initramfs path must differ from the original initramfs"))]
+    DebugInitramfsConflict,
+
+    #[snafu(display(
+        "kernel paths {} and {} both resolve to {}",
+        first,
+        second,
+        path.display()
+    ))]
+    KernelPathConflict {
+        first: &'static str,
+        second: &'static str,
+        path: PathBuf,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -147,6 +175,9 @@ pub enum Command {
 
     /// Reverse engineering challenge
     Rev(RevOpts),
+
+    /// Linux kernel exploitation challenge
+    Kernel(KernelOpts),
 
     /// Download a libc by version without a local libc file
     FetchLibc(FetchLibcOpts),
@@ -268,6 +299,80 @@ pub struct RevOpts {
     pub best_effort: bool,
 }
 
+/// Options for Linux kernel exploitation challenge initialization
+#[derive(Args, Setters, Clone)]
+#[setters(generate = "false")]
+#[setters(prefix = "with_")]
+pub struct KernelOpts {
+    /// Path to the x86-64 kernel image or bzImage (auto-detected if not set)
+    #[arg(short = 'k', long)]
+    #[setters(generate)]
+    pub kernel: Option<PathBuf>,
+
+    /// Path to the initramfs archive (auto-detected if not set)
+    #[arg(short = 'i', long)]
+    #[setters(generate)]
+    pub initramfs: Option<PathBuf>,
+
+    /// Path for the generated debug initramfs (derived from --initramfs if not set)
+    #[arg(long)]
+    #[setters(generate)]
+    pub debug_initramfs: Option<PathBuf>,
+
+    /// Path to an existing QEMU launcher (auto-detected if not set)
+    #[arg(short = 'r', long)]
+    #[setters(generate)]
+    pub run_script: Option<PathBuf>,
+
+    /// Directory for the unpacked initramfs
+    #[arg(long, default_value = "initramfs")]
+    pub rootfs_dir: PathBuf,
+
+    /// Path for the extracted uncompressed kernel ELF
+    #[arg(long, default_value = "vmlinux")]
+    pub vmlinux_path: PathBuf,
+
+    /// Path for the generated no-mitigation QEMU launcher
+    #[arg(long, default_value = "run-debug.sh")]
+    pub debug_run_path: PathBuf,
+
+    /// Path for the generated exploit source
+    #[arg(short = 's', long, default_value = "exploit.c")]
+    pub exploit_path: PathBuf,
+
+    /// Path for the generated compile-and-repack helper
+    #[arg(long, default_value = "build-exploit.sh")]
+    pub build_path: PathBuf,
+
+    /// Directory for kernel modules exported from the initramfs
+    #[arg(long, default_value = "kernel_modules")]
+    pub modules_dir: PathBuf,
+
+    /// Path to a custom C exploit template
+    #[arg(short = 't', long)]
+    pub template_path: Option<PathBuf>,
+
+    /// Skip generating the exploit source
+    #[arg(long, conflicts_with = "template_path")]
+    pub no_template: bool,
+
+    /// Skip extracting vmlinux from the kernel image
+    #[arg(long)]
+    pub no_vmlinux: bool,
+
+    /// Skip copying kernel modules out of the initramfs
+    #[arg(long)]
+    pub no_export_modules: bool,
+
+    /// Overwrite known generated outputs
+    #[arg(short = 'f', long)]
+    pub force: bool,
+
+    /// Continue independent setup steps after a failure
+    #[arg(long)]
+    pub best_effort: bool,
+}
+
 /// Options for downloading a libc by version
 #[derive(Args, Clone)]
 pub struct FetchLibcOpts {
@@ -367,6 +472,29 @@ impl Default for RevOpts {
     }
 }
 
+impl Default for KernelOpts {
+    fn default() -> Self {
+        Self {
+            kernel: None,
+            initramfs: None,
+            debug_initramfs: None,
+            run_script: None,
+            rootfs_dir: PathBuf::from("initramfs"),
+            vmlinux_path: PathBuf::from("vmlinux"),
+            debug_run_path: PathBuf::from("run-debug.sh"),
+            exploit_path: PathBuf::from("exploit.c"),
+            build_path: PathBuf::from("build-exploit.sh"),
+            modules_dir: PathBuf::from("kernel_modules"),
+            template_path: None,
+            no_template: false,
+            no_vmlinux: false,
+            no_export_modules: false,
+            force: false,
+            best_effort: false,
+        }
+    }
+}
+
 impl Opts {
     pub fn validate(&self) -> std::result::Result<(), String> {
         let validate_pwn = |opts: &PwnOpts| {
@@ -395,6 +523,14 @@ impl Opts {
         match &self.cmd {
             Some(Command::Pwn(opts)) => validate_pwn(opts)?,
             Some(Command::Rev(opts)) => validate_python_identifier(&opts.template_bin_name)?,
+            Some(Command::Kernel(opts)) => {
+                if let Some((first, second, path)) = kernel_path_conflict(opts) {
+                    return Err(format!(
+                        "kernel paths {first} and {second} both resolve to {}",
+                        path.display()
+                    ));
+                }
+            }
             Some(Command::FetchLibc(opts)) => {
                 const DEFAULT_REPO: &str = "https://deb.debian.org/debian";
                 match opts.source {
@@ -482,6 +618,16 @@ impl Opts {
             Some(Command::Rev(opts)) => {
                 f(&opts.bin, "bin", Color::BrightBlue);
             }
+            Some(Command::Kernel(opts)) => {
+                f(&opts.kernel, "kernel", Color::BrightBlue);
+                f(&opts.initramfs, "initramfs", Color::Yellow);
+                f(
+                    &opts.debug_initramfs,
+                    "debug initramfs",
+                    Color::BrightYellow,
+                );
+                f(&opts.run_script, "run", Color::Green);
+            }
             Some(Command::FetchLibc(_)) => {}
             None => {
                 f(&self.pwn.bin, "bin", Color::BrightBlue);
@@ -509,6 +655,16 @@ impl Opts {
                 Ok(Opts {
                     pwn: self.pwn,
                     cmd: Some(Command::Rev(opts)),
+                    quiet: self.quiet,
+                    verbose: self.verbose,
+                    json: self.json,
+                })
+            }
+            Some(Command::Kernel(opts)) => {
+                let opts = resolve_kernel(opts)?;
+                Ok(Opts {
+                    pwn: self.pwn,
+                    cmd: Some(Command::Kernel(opts)),
                     quiet: self.quiet,
                     verbose: self.verbose,
                     json: self.json,
@@ -587,6 +743,13 @@ struct DetectedPaths {
     ld: Vec<PathBuf>,
 }
 
+#[derive(Default)]
+struct DetectedKernelPaths {
+    kernel: Vec<PathBuf>,
+    initramfs: Vec<PathBuf>,
+    run_script: Vec<PathBuf>,
+}
+
 fn scan_current_dir() -> Result<DetectedPaths> {
     fold_current_dir(DetectedPaths::default(), |mut found, dir_ent| {
         if let Some(path) = detect_path_if(&dir_ent, is_bin)? {
@@ -600,6 +763,94 @@ fn scan_current_dir() -> Result<DetectedPaths> {
         }
         Ok(found)
     })
+}
+
+fn scan_kernel_current_dir(
+    need_kernel: bool,
+    need_initramfs: bool,
+    need_run_script: bool,
+) -> Result<DetectedKernelPaths> {
+    let mut found = DetectedKernelPaths::default();
+    if !need_kernel && !need_initramfs && !need_run_script {
+        return Ok(found);
+    }
+    for dir_ent in fs::read_dir(".").context(ReadDirSnafu)? {
+        let dir_ent = dir_ent.context(DirEntSnafu)?;
+        let path = dir_ent.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+
+        let conventional_kernel_name = name.starts_with("vmlinuz")
+            || name.starts_with("bzImage")
+            || name.starts_with("bzimage")
+            || name == "Image";
+        if need_kernel && conventional_kernel_name && kernel_image::is_kernel_image(&path) {
+            found.kernel.push(path.clone());
+        }
+        let conventional_initramfs_name = name.contains("initramfs")
+            || name.starts_with("initrd")
+            || name.contains("rootfs")
+            || name.contains(".cpio");
+        if need_initramfs
+            && conventional_initramfs_name
+            && !name.contains("-debug")
+            && kernel_initramfs::detect_file_compression(&path).is_ok()
+        {
+            found.initramfs.push(path.clone());
+        }
+        let is_shell_script = path.extension().and_then(|ext| ext.to_str()) == Some("sh");
+        if need_run_script
+            && is_shell_script
+            && name != "run-debug.sh"
+            && std::fs::read(&path)
+                .map(|bytes| {
+                    bytes
+                        .windows(b"qemu-system".len())
+                        .any(|window| window == b"qemu-system")
+                })
+                .unwrap_or(false)
+        {
+            found.run_script.push(path);
+        }
+    }
+    Ok(found)
+}
+
+fn select_run_script(
+    mut candidates: Vec<PathBuf>,
+    kernel: Option<&Path>,
+    initramfs: Option<&Path>,
+) -> Result<Option<PathBuf>> {
+    candidates.sort();
+    candidates.dedup();
+    if candidates.len() <= 1 {
+        return Ok(candidates.into_iter().next());
+    }
+
+    let referenced = candidates
+        .iter()
+        .filter(|path| {
+            let Ok(contents) = std::fs::read_to_string(path) else {
+                return false;
+            };
+            [kernel, initramfs]
+                .into_iter()
+                .flatten()
+                .filter_map(Path::file_name)
+                .filter_map(OsStr::to_str)
+                .all(|name| contents.contains(name))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if referenced.len() == 1 {
+        return Ok(referenced.into_iter().next());
+    }
+    select_candidate("QEMU launcher", candidates)
 }
 
 fn select_candidate(kind: &'static str, mut candidates: Vec<PathBuf>) -> Result<Option<PathBuf>> {
@@ -644,6 +895,129 @@ fn resolve_rev(mut opts: RevOpts) -> Result<RevOpts> {
         return Err(Error::MissingBinary);
     }
     Ok(opts)
+}
+
+fn resolve_kernel(mut opts: KernelOpts) -> Result<KernelOpts> {
+    let detected = scan_kernel_current_dir(
+        opts.kernel.is_none(),
+        opts.initramfs.is_none(),
+        opts.run_script.is_none(),
+    )?;
+    if opts.kernel.is_none() {
+        opts.kernel = select_candidate("kernel image", detected.kernel)?;
+    }
+    if opts.initramfs.is_none() {
+        opts.initramfs = select_candidate("initramfs", detected.initramfs)?;
+    }
+    if opts.debug_initramfs.is_none() {
+        opts.debug_initramfs = opts.initramfs.as_deref().map(debug_initramfs_path);
+    }
+    if opts.run_script.is_none() {
+        opts.run_script = select_run_script(
+            detected.run_script,
+            opts.kernel.as_deref(),
+            opts.initramfs.as_deref(),
+        )?;
+    }
+    if opts.kernel.is_none() {
+        return Err(Error::MissingKernel);
+    }
+    if opts.initramfs.is_none() {
+        return Err(Error::MissingInitramfs);
+    }
+    if opts.initramfs == opts.debug_initramfs {
+        return Err(Error::DebugInitramfsConflict);
+    }
+    if let Some((first, second, path)) = kernel_path_conflict(&opts) {
+        return Err(Error::KernelPathConflict {
+            first,
+            second,
+            path,
+        });
+    }
+    Ok(opts)
+}
+
+fn kernel_path_conflict(opts: &KernelOpts) -> Option<(&'static str, &'static str, PathBuf)> {
+    let paths = [
+        ("--kernel", opts.kernel.as_ref()),
+        ("--initramfs", opts.initramfs.as_ref()),
+        ("--debug-initramfs", opts.debug_initramfs.as_ref()),
+        ("--run-script", opts.run_script.as_ref()),
+        ("--template-path", opts.template_path.as_ref()),
+        ("--rootfs-dir", Some(&opts.rootfs_dir)),
+        ("--vmlinux-path", Some(&opts.vmlinux_path)),
+        ("--debug-run-path", Some(&opts.debug_run_path)),
+        ("--exploit-path", Some(&opts.exploit_path)),
+        ("--build-path", Some(&opts.build_path)),
+        ("--modules-dir", Some(&opts.modules_dir)),
+    ];
+    for (index, (first_label, first_path)) in paths.iter().enumerate() {
+        let Some(first_path) = first_path else {
+            continue;
+        };
+        let first_path = comparable_path(first_path);
+        for (second_label, second_path) in &paths[index + 1..] {
+            let Some(second_path) = second_path else {
+                continue;
+            };
+            let second_path = comparable_path(second_path);
+            if first_path == second_path {
+                return Some((*first_label, *second_label, first_path));
+            }
+        }
+    }
+    None
+}
+
+fn comparable_path(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+
+    let mut existing = normalized.as_path();
+    let mut suffix = Vec::new();
+    while !existing.exists() {
+        let Some(name) = existing.file_name() else {
+            break;
+        };
+        suffix.push(name.to_os_string());
+        let Some(parent) = existing.parent() else {
+            break;
+        };
+        existing = parent;
+    }
+    let mut resolved = std::fs::canonicalize(existing).unwrap_or_else(|_| existing.to_path_buf());
+    for component in suffix.into_iter().rev() {
+        resolved.push(component);
+    }
+    resolved
+}
+
+fn debug_initramfs_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("initramfs");
+    let debug_name = match name.find('.') {
+        Some(index) if index > 0 => format!("{}-debug{}", &name[..index], &name[index..]),
+        _ => format!("{name}-debug"),
+    };
+    path.with_file_name(debug_name)
 }
 
 fn validate_python_identifier(value: &str) -> std::result::Result<(), String> {
@@ -764,6 +1138,7 @@ mod tests {
         match opts.cmd {
             Some(Command::FetchLibc(fetch_opts)) => fetch_opts,
             Some(Command::Rev(_)) => panic!("expected fetch-libc command, got rev"),
+            Some(Command::Kernel(_)) => panic!("expected fetch-libc command, got kernel"),
             Some(Command::Pwn(_)) => panic!("expected fetch-libc command, got pwn"),
             None => panic!("expected fetch-libc command, got default pwn"),
         }
@@ -961,5 +1336,89 @@ mod tests {
         let err = select_candidate("binary", vec![PathBuf::from("b"), PathBuf::from("a")])
             .expect_err("multiple candidates should fail");
         assert!(err.to_string().contains("a, b"));
+    }
+
+    #[test]
+    fn kernel_command_parses_full_development_setup_defaults() {
+        let opts = Opts::try_parse_from(["pwninit", "kernel"]).expect("kernel should parse");
+        let Some(Command::Kernel(kernel)) = opts.cmd else {
+            panic!("expected kernel command");
+        };
+        assert_eq!(kernel.rootfs_dir, PathBuf::from("initramfs"));
+        assert_eq!(kernel.modules_dir, PathBuf::from("kernel_modules"));
+        assert_eq!(kernel.debug_run_path, PathBuf::from("run-debug.sh"));
+        assert_eq!(kernel.exploit_path, PathBuf::from("exploit.c"));
+        assert_eq!(kernel.build_path, PathBuf::from("build-exploit.sh"));
+        assert!(!kernel.no_template);
+        assert!(!kernel.no_vmlinux);
+        assert!(!kernel.no_export_modules);
+    }
+
+    #[test]
+    fn kernel_command_accepts_bzimage_and_debug_initramfs_paths() {
+        let opts = Opts::try_parse_from([
+            "pwninit",
+            "kernel",
+            "--kernel",
+            "bzImage",
+            "--initramfs",
+            "initramfs.cpio.gz",
+            "--debug-initramfs",
+            "initramfs-debug.cpio.gz",
+        ])
+        .expect("kernel paths should parse");
+        let Some(Command::Kernel(kernel)) = opts.cmd else {
+            panic!("expected kernel command");
+        };
+        assert_eq!(kernel.kernel, Some(PathBuf::from("bzImage")));
+        assert_eq!(
+            kernel.debug_initramfs,
+            Some(PathBuf::from("initramfs-debug.cpio.gz"))
+        );
+    }
+
+    #[test]
+    fn debug_initramfs_name_is_derived_without_overwriting_original() {
+        assert_eq!(
+            debug_initramfs_path(Path::new("initramfs.cpio.gz")),
+            PathBuf::from("initramfs-debug.cpio.gz")
+        );
+        assert_eq!(
+            debug_initramfs_path(Path::new("challenge/bz-rootfs.xz")),
+            PathBuf::from("challenge/bz-rootfs-debug.xz")
+        );
+    }
+
+    #[test]
+    fn kernel_rejects_same_original_and_debug_initramfs() {
+        let opts = Opts::try_parse_from([
+            "pwninit",
+            "kernel",
+            "--initramfs",
+            "rootfs.cpio",
+            "--debug-initramfs",
+            "rootfs.cpio",
+        ])
+        .expect("paths parse before validation");
+        assert!(opts.validate().is_err());
+    }
+
+    #[test]
+    fn kernel_rejects_generated_output_path_collisions() {
+        let opts = Opts::try_parse_from(["pwninit", "kernel", "--exploit-path", "run-debug.sh"])
+            .expect("paths parse before validation");
+        assert!(opts.validate().is_err());
+    }
+
+    #[test]
+    fn kernel_path_collisions_normalize_dot_components() {
+        let opts = KernelOpts {
+            initramfs: Some(PathBuf::from("./initramfs")),
+            rootfs_dir: PathBuf::from("initramfs"),
+            ..KernelOpts::default()
+        };
+        let conflict = kernel_path_conflict(&opts).expect("paths should conflict");
+        assert_eq!(conflict.0, "--initramfs");
+        assert_eq!(conflict.1, "--rootfs-dir");
     }
 }
