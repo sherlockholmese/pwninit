@@ -1068,7 +1068,7 @@ dependencies = [
 
 [[package]]
 name = "pwninit"
-version = "3.14.0"
+version = "4.0.0"
 dependencies = [
  "ar",
  "bzip2",
