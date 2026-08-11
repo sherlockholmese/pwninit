@@ -141,8 +141,8 @@ Build the generated Intel-syntax exploit and repack only the debug initramfs:
 ./build-exploit.sh
 ```
 
-The helper defaults to `gcc -static -O2 -masm=intel`. Override `CC`, `CFLAGS`,
-or `EXPLOIT_NAME` through the environment. It requires `cpio` and the
+The helper defaults to `gcc -static`. Override `CC`, `CFLAGS`, or
+`EXPLOIT_NAME` through the environment. It requires `cpio` and the
 compressor used by the original archive.
 
 Plain newc CPIO and gzip, xz, legacy lzma, bzip2, zstd, modern lz4, and legacy

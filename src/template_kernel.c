@@ -23,6 +23,7 @@ static void save_userland_state() {
         "mov user_sp, rsp;"
         "pushfq;"
         "pop user_rflags;"
+        ".att_syntax prefix;"
     );
     puts("[+] Saved userland state");
 }

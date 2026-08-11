@@ -719,7 +719,7 @@ pub fn generate_build_helper(opts: &KernelOpts, compression: Compression) -> Res
 set -eu
 
 CC=${{CC:-gcc}}
-CFLAGS=${{CFLAGS:--static -O2 -masm=intel}}
+CFLAGS=${{CFLAGS:--static}}
 EXPLOIT_NAME=${{EXPLOIT_NAME:-exploit}}
 
 case "$EXPLOIT_NAME" in
@@ -893,7 +893,9 @@ mod tests {
             "archive={}",
             opts.initramfs.as_deref().expect("original path").display()
         )));
-        assert!(script.contains("-masm=intel"));
+        assert!(script.contains("CFLAGS=${CFLAGS:--static}"));
+        assert!(!script.contains("-O2"));
+        assert!(!script.contains("-masm=intel"));
     }
 
     #[test]
@@ -914,7 +916,7 @@ mod tests {
         assert!(source.contains("int main()"));
         assert!(source.contains(".intel_syntax noprefix"));
         assert!(!source.contains("(void)"));
-        assert!(!source.contains(".att_syntax"));
+        assert!(source.contains(".att_syntax prefix"));
     }
 
     #[test]
