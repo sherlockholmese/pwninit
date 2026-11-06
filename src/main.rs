@@ -5,7 +5,7 @@ use pwninit::opts::Opts;
 use clap::{CommandFactory, Parser};
 
 fn main() {
-    let opts = Opts::parse();
+    let opts = Opts::parse().with_resolved_command();
     pwninit::output::configure(opts.quiet, opts.verbose, opts.json);
 
     if let Err(message) = opts.validate() {

@@ -4,7 +4,7 @@ use crate::kernel_image;
 use crate::kernel_initramfs;
 use crate::maybe_visit_libc_report;
 use crate::needed_glibc_libraries_result;
-use crate::opts::{self, Command, FetchLibcSource, Opts};
+use crate::opts::{self, Command, LibcSource, Opts, SkipStep};
 use crate::output::{self, Step, Summary};
 use crate::patch_bin;
 use crate::set_bin_exec_pwn;
@@ -48,9 +48,14 @@ pub enum Error {
 
 pub type Result<T = ()> = std::result::Result<T, Error>;
 
-fn run_fetch_libc(fetch_opts: crate::opts::FetchLibcOpts, summary: &mut Summary) -> Result {
-    let mut extra_libs = fetch_opts.extra_libs;
-    if let Some(bin) = fetch_opts.from_bin {
+fn run_libc(libc: opts::LibcCommand, summary: &mut Summary) -> Result {
+    let output = match &libc.source {
+        LibcSource::Launchpad(opts) => &opts.output,
+        LibcSource::Docker(opts) => &opts.output,
+        LibcSource::Debian(opts) => &opts.output,
+    };
+    let mut extra_libs = output.extra_libs.clone();
+    if let Some(bin) = output.from_bin.clone() {
         let mut pwn_opts = crate::opts::PwnOpts::default();
         pwn_opts.bin = Some(bin);
         match needed_glibc_libraries_result(&pwn_opts) {
@@ -65,7 +70,9 @@ fn run_fetch_libc(fetch_opts: crate::opts::FetchLibcOpts, summary: &mut Summary)
             }
         }
     }
-    if let Err(err) = fs::create_dir_all(&fetch_opts.output_dir) {
+    let output_dir = &output.output_dir;
+    let arch = output.arch;
+    if let Err(err) = fs::create_dir_all(output_dir) {
         summary.push(Step::failed(
             "prepare output directory",
             err.to_string(),
@@ -73,10 +80,10 @@ fn run_fetch_libc(fetch_opts: crate::opts::FetchLibcOpts, summary: &mut Summary)
         ));
         return Ok(());
     }
-    let libc_output = if fetch_opts.libc_output.is_absolute() {
-        fetch_opts.libc_output.clone()
+    let libc_output = if output.libc_output.is_absolute() {
+        output.libc_output.clone()
     } else {
-        fetch_opts.output_dir.join(&fetch_opts.libc_output)
+        output_dir.join(&output.libc_output)
     };
     if let Some(parent) = libc_output.parent() {
         if let Err(err) = fs::create_dir_all(parent) {
@@ -85,63 +92,50 @@ fn run_fetch_libc(fetch_opts: crate::opts::FetchLibcOpts, summary: &mut Summary)
         }
     }
 
-    let result = match fetch_opts.source {
-        FetchLibcSource::Launchpad => {
-            let Some(version) = fetch_opts.version.as_deref() else {
-                return Err(fetch_libc::Error::MissingLaunchpadVersion).context(FetchLibcSnafu);
-            };
-            fetch_libc::fetch_libc_selected(
-                version,
-                fetch_opts.arch,
-                &libc_output,
-                &fetch_opts.output_dir,
-                &extra_libs,
-                fetch_opts.non_interactive || fetch_opts.exact_version.is_some(),
-                fetch_opts.exact_version.as_deref(),
-            )
-            .context(FetchLibcSnafu)
-        }
-        FetchLibcSource::Docker => {
+    let result = match &libc.source {
+        LibcSource::Launchpad(opts) => fetch_libc::fetch_libc_selected(
+            &opts.version,
+            arch,
+            &libc_output,
+            output_dir,
+            &extra_libs,
+            opts.select.non_interactive || opts.select.exact_version.is_some(),
+            opts.select.exact_version.as_deref(),
+        )
+        .context(FetchLibcSnafu),
+        LibcSource::Docker(opts) => {
             let image = fetch_libc::docker_image_name(
-                fetch_opts.image.as_deref(),
-                fetch_opts.distro.as_deref(),
-                fetch_opts.release.as_deref(),
+                opts.image.as_deref(),
+                opts.distro.as_deref(),
+                opts.release.as_deref(),
             )
             .context(FetchLibcSnafu)?;
             fetch_libc::fetch_libc_from_docker_to(
                 &image,
-                fetch_opts.arch,
+                arch,
                 &libc_output,
-                &fetch_opts.output_dir,
+                output_dir,
                 &extra_libs,
             )
             .context(FetchLibcSnafu)
         }
-        FetchLibcSource::Debian => {
-            let Some(version) = fetch_opts.version.as_deref() else {
-                return Err(fetch_libc::Error::MissingDebianVersion).context(FetchLibcSnafu);
-            };
-            let Some(release) = fetch_opts.release.as_deref() else {
-                return Err(fetch_libc::Error::MissingDebianRelease).context(FetchLibcSnafu);
-            };
-            fetch_libc::fetch_libc_from_debian_selected(
-                version,
-                fetch_opts.arch,
-                release,
-                &fetch_opts.repo_url,
-                &libc_output,
-                &fetch_opts.output_dir,
-                &extra_libs,
-                fetch_opts.non_interactive || fetch_opts.exact_version.is_some(),
-                fetch_opts.exact_version.as_deref(),
-            )
-            .context(FetchLibcSnafu)
-        }
+        LibcSource::Debian(opts) => fetch_libc::fetch_libc_from_debian_selected(
+            &opts.version,
+            arch,
+            &opts.release,
+            &opts.repo_url,
+            &libc_output,
+            output_dir,
+            &extra_libs,
+            opts.select.non_interactive || opts.select.exact_version.is_some(),
+            opts.select.exact_version.as_deref(),
+        )
+        .context(FetchLibcSnafu),
     };
     match result {
         Ok(()) => summary.push(Step::completed(
             "fetch libc",
-            format!("artifacts written to {}", fetch_opts.output_dir.display()),
+            format!("artifacts written to {}", output_dir.display()),
         )),
         Err(err) => summary.push(Step::failed("fetch libc", err.to_string(), true)),
     }
@@ -224,7 +218,7 @@ fn run_rev_flow(rev_opts: crate::opts::RevOpts, summary: &mut Summary) {
             "generate solve script",
             "binary preparation failed",
         ));
-    } else if !rev_opts.no_template {
+    } else if !rev_opts.skips(SkipStep::Template) {
         record_solve_result(
             summary,
             &rev_opts.solve_path,
@@ -233,18 +227,12 @@ fn run_rev_flow(rev_opts: crate::opts::RevOpts, summary: &mut Summary) {
     } else {
         summary.push(Step::skipped(
             "generate solve script",
-            "--no-template was requested",
+            "--skip template was requested",
         ));
     }
 }
 
 fn run_pwn_flow(mut pwn_opts: crate::opts::PwnOpts, summary: &mut Summary) {
-    if pwn_opts.no_patch_bin {
-        output::warning("--no-patch-bin is deprecated; use --patch-mode none");
-    }
-    if pwn_opts.no_patchelf {
-        output::warning("--no-patchelf is deprecated; use --patch-mode manual");
-    }
     let binary_ready = push_required(
         summary,
         "prepare binary",
@@ -349,7 +337,7 @@ fn run_pwn_flow(mut pwn_opts: crate::opts::PwnOpts, summary: &mut Summary) {
     } else {
         summary.push(Step::skipped(
             "patch binary",
-            "--patch-mode none was selected",
+            "--skip patch was requested",
         ));
         true
     };
@@ -364,7 +352,7 @@ fn run_pwn_flow(mut pwn_opts: crate::opts::PwnOpts, summary: &mut Summary) {
             "generate solve script",
             "binary patching failed",
         ));
-    } else if !pwn_opts.no_template {
+    } else if !pwn_opts.skips(SkipStep::Template) {
         record_solve_result(
             summary,
             &pwn_opts.solve_path,
@@ -373,7 +361,7 @@ fn run_pwn_flow(mut pwn_opts: crate::opts::PwnOpts, summary: &mut Summary) {
     } else {
         summary.push(Step::skipped(
             "generate solve script",
-            "--no-template was requested",
+            "--skip template was requested",
         ));
     }
 }
@@ -525,10 +513,10 @@ fn run_kernel_flow(kernel_opts: crate::opts::KernelOpts, summary: &mut Summary) 
         false
     };
 
-    if kernel_opts.no_export_modules {
+    if kernel_opts.skips(SkipStep::Modules) {
         summary.push(Step::skipped(
             "export kernel modules",
-            "--no-export-modules was requested",
+            "--skip modules was requested",
         ));
     } else if !rootfs_ready {
         summary.push(Step::skipped(
@@ -557,10 +545,10 @@ fn run_kernel_flow(kernel_opts: crate::opts::KernelOpts, summary: &mut Summary) 
         }
     }
 
-    if kernel_opts.no_vmlinux {
+    if kernel_opts.skips(SkipStep::Vmlinux) {
         summary.push(Step::skipped(
             "extract vmlinux",
-            "--no-vmlinux was requested",
+            "--skip vmlinux was requested",
         ));
     } else if !kernel_ready {
         summary.push(Step::skipped(
@@ -613,10 +601,10 @@ fn run_kernel_flow(kernel_opts: crate::opts::KernelOpts, summary: &mut Summary) 
         ));
     }
 
-    if kernel_opts.no_template {
+    if kernel_opts.skips(SkipStep::Template) {
         summary.push(Step::skipped(
             "generate exploit",
-            "--no-template was requested",
+            "--skip template was requested",
         ));
     } else if !rootfs_ready {
         summary.push(Step::skipped(
@@ -660,13 +648,229 @@ fn run_kernel_flow(kernel_opts: crate::opts::KernelOpts, summary: &mut Summary) 
     }
 }
 
-pub fn run_with_summary(opts: Opts) -> Result<Summary> {
-    let mut summary = match &opts.cmd {
-        Some(Command::FetchLibc(_)) => Summary::new("fetch-libc"),
-        Some(Command::Rev(_)) => Summary::new("rev"),
-        Some(Command::Kernel(_)) => Summary::new("kernel"),
-        Some(Command::Pwn(_)) | None => Summary::new("pwn"),
+/// A "write this file" step for a dry run, honouring `--force`.
+fn plan_write(name: &str, path: &std::path::Path, force: bool) -> Step {
+    if path.exists() && !force {
+        Step::skipped(
+            name,
+            format!(
+                "{} already exists; use --force to overwrite",
+                path.display()
+            ),
+        )
+    } else if path.exists() {
+        Step::planned(name, format!("overwrite {}", path.display()))
+    } else {
+        Step::planned(name, format!("write {}", path.display()))
+    }
+}
+
+fn plan_pwn(opts: &opts::PwnOpts, summary: &mut Summary) {
+    let bin = opts.bin.as_deref().map(|p| p.display().to_string());
+    summary.push(Step::planned(
+        "prepare binary",
+        format!("make {} executable", bin.as_deref().unwrap_or("binary")),
+    ));
+    match &opts.libc {
+        Some(libc) => {
+            let mut detail = format!("inspect {}", libc.display());
+            if opts.ld.is_none() {
+                detail.push_str(", download a matching linker");
+            }
+            if !opts.skips(SkipStep::Unstrip) {
+                detail.push_str(", download debug symbols and unstrip");
+            }
+            summary.push(Step::planned("prepare libc", detail));
+        }
+        None => summary.push(Step::skipped("prepare libc", "no libc was provided")),
+    }
+    match (&opts.ld, &opts.libc) {
+        (Some(ld), _) => summary.push(Step::planned(
+            "prepare linker",
+            format!("make {} executable", ld.display()),
+        )),
+        (None, Some(_)) => summary.push(Step::planned(
+            "prepare linker",
+            "make the downloaded linker executable",
+        )),
+        (None, None) => summary.push(Step::skipped("prepare linker", "no linker was provided")),
+    }
+    if opts.uv {
+        summary.push(Step::planned("create environment", "create .venv with pwntools"));
+    } else {
+        summary.push(Step::skipped("create environment", "--uv was not requested"));
+    }
+    match opts.resolved_patch_mode() {
+        Some(mode) => {
+            let target = patch_bin::bin_patched_path(opts)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "patched copy".to_string());
+            let how = match mode {
+                opts::PatchMode::Patchelf => "patchelf",
+                opts::PatchMode::Manual => "manual ELF rewrite",
+            };
+            summary.push(Step::planned(
+                "patch binary",
+                format!("write {target} using {how}"),
+            ));
+        }
+        None => summary.push(Step::skipped("patch binary", "--skip patch was requested")),
+    }
+    if opts.skips(SkipStep::Template) {
+        summary.push(Step::skipped(
+            "generate solve script",
+            "--skip template was requested",
+        ));
+    } else {
+        summary.push(plan_write("generate solve script", &opts.solve_path, opts.force));
+    }
+}
+
+fn plan_rev(opts: &opts::RevOpts, summary: &mut Summary) {
+    let bin = opts.bin.as_deref().map(|p| p.display().to_string());
+    summary.push(Step::planned(
+        "prepare binary",
+        format!("make {} executable", bin.as_deref().unwrap_or("binary")),
+    ));
+    if opts.uv {
+        summary.push(Step::planned("create environment", "create .venv with angr and z3"));
+    } else {
+        summary.push(Step::skipped("create environment", "--uv was not requested"));
+    }
+    if opts.skips(SkipStep::Template) {
+        summary.push(Step::skipped(
+            "generate solve script",
+            "--skip template was requested",
+        ));
+    } else {
+        summary.push(plan_write("generate solve script", &opts.solve_path, opts.force));
+    }
+}
+
+fn plan_kernel(opts: &opts::KernelOpts, summary: &mut Summary) {
+    if let Some(kernel) = &opts.kernel {
+        summary.push(Step::planned(
+            "inspect kernel image",
+            format!("check {}", kernel.display()),
+        ));
+    }
+    if let Some(initramfs) = &opts.initramfs {
+        let detail = format!(
+            "unpack {} into {}",
+            initramfs.display(),
+            opts.rootfs_dir.display()
+        );
+        if opts.rootfs_dir.exists() && !opts.force {
+            summary.push(Step::skipped(
+                "extract initramfs",
+                format!(
+                    "{} already exists; use --force to replace",
+                    opts.rootfs_dir.display()
+                ),
+            ));
+        } else {
+            summary.push(Step::planned("extract initramfs", detail));
+        }
+    }
+    if let Some(debug) = &opts.debug_initramfs {
+        summary.push(plan_write("prepare debug initramfs", debug, opts.force));
+    }
+    if opts.skips(SkipStep::Modules) {
+        summary.push(Step::skipped(
+            "export kernel modules",
+            "--skip modules was requested",
+        ));
+    } else {
+        summary.push(Step::planned(
+            "export kernel modules",
+            format!("copy .ko files into {}", opts.modules_dir.display()),
+        ));
+    }
+    if opts.skips(SkipStep::Vmlinux) {
+        summary.push(Step::skipped("extract vmlinux", "--skip vmlinux was requested"));
+    } else {
+        summary.push(plan_write("extract vmlinux", &opts.vmlinux_path, opts.force));
+    }
+    match kernel::relative_flag_paths(opts) {
+        Ok(paths) if paths.is_empty() => summary.push(Step::skipped(
+            "create local flag",
+            "no relative flag disk was referenced",
+        )),
+        Ok(paths) => {
+            for path in paths {
+                // Placeholder flags are preserved even when --force is set.
+                summary.push(if path.exists() {
+                    Step::skipped(
+                        "create local flag",
+                        format!("{} already exists; preserved", path.display()),
+                    )
+                } else {
+                    plan_write("create local flag", &path, false)
+                });
+            }
+        }
+        Err(err) => summary.push(Step::failed("create local flag", err.to_string(), true)),
+    }
+    summary.push(plan_write(
+        "generate debug launcher",
+        &opts.debug_run_path,
+        opts.force,
+    ));
+    if opts.skips(SkipStep::Template) {
+        summary.push(Step::skipped(
+            "generate exploit",
+            "--skip template was requested",
+        ));
+    } else {
+        summary.push(plan_write("generate exploit", &opts.exploit_path, opts.force));
+    }
+    summary.push(plan_write(
+        "generate build helper",
+        &opts.build_path,
+        opts.force,
+    ));
+}
+
+fn plan_libc(libc: &opts::LibcCommand, summary: &mut Summary) {
+    let (what, output) = match &libc.source {
+        LibcSource::Launchpad(opts) => (
+            format!("glibc {} from Launchpad", opts.version),
+            &opts.output,
+        ),
+        LibcSource::Docker(opts) => {
+            let image = opts.image.clone().unwrap_or_else(|| {
+                format!(
+                    "{}:{}",
+                    opts.distro.as_deref().unwrap_or_default(),
+                    opts.release.as_deref().unwrap_or_default()
+                )
+            });
+            (format!("libc from docker image {image}"), &opts.output)
+        }
+        LibcSource::Debian(opts) => (
+            format!("glibc {} from Debian {}", opts.version, opts.release),
+            &opts.output,
+        ),
     };
+    let mut detail = format!(
+        "download {what} ({}) to {}",
+        output.arch,
+        output.output_dir.join(&output.libc_output).display()
+    );
+    if !output.extra_libs.is_empty() {
+        detail.push_str(&format!(", plus {}", output.extra_libs.join(", ")));
+    }
+    if let Some(bin) = &output.from_bin {
+        detail.push_str(&format!(", plus libraries needed by {}", bin.display()));
+    }
+    summary.push(Step::planned("fetch libc", detail));
+}
+
+pub fn run_with_summary(opts: Opts) -> Result<Summary> {
+    let opts = opts.with_resolved_command();
+    let mut summary = Summary::new(opts.command_name());
+    summary.dry_run = opts.dry_run;
+    let dry_run = opts.dry_run;
     let opts = match opts.find_if_unspec() {
         Ok(opts) => opts,
         Err(err) => {
@@ -677,22 +881,27 @@ pub fn run_with_summary(opts: Opts) -> Result<Summary> {
 
     // Print detected files
     opts.print();
-    output::verbose(format!(
-        "resolved command: {}",
-        match &opts.cmd {
-            Some(Command::FetchLibc(_)) => "fetch-libc",
-            Some(Command::Rev(_)) => "rev",
-            Some(Command::Kernel(_)) => "kernel",
-            Some(Command::Pwn(_)) | None => "pwn",
-        }
-    ));
+    output::verbose(format!("resolved command: {}", opts.command_name()));
 
-    match opts.cmd {
-        Some(Command::FetchLibc(fetch_opts)) => run_fetch_libc(fetch_opts, &mut summary)?,
-        Some(Command::Rev(rev_opts)) => run_rev_flow(rev_opts, &mut summary),
-        Some(Command::Kernel(kernel_opts)) => run_kernel_flow(kernel_opts, &mut summary),
-        Some(Command::Pwn(pwn_opts)) => run_pwn_flow(pwn_opts, &mut summary),
-        None => run_pwn_flow(opts.pwn, &mut summary),
+    let Some(cmd) = opts.cmd else {
+        unreachable!("with_resolved_command always sets a command");
+    };
+
+    if dry_run {
+        match &cmd {
+            Command::Pwn(opts) => plan_pwn(opts, &mut summary),
+            Command::Rev(opts) => plan_rev(opts, &mut summary),
+            Command::Kernel(opts) => plan_kernel(opts, &mut summary),
+            Command::Libc(libc) => plan_libc(libc, &mut summary),
+        }
+        return Ok(summary);
+    }
+
+    match cmd {
+        Command::Libc(libc) => run_libc(libc, &mut summary)?,
+        Command::Rev(rev_opts) => run_rev_flow(rev_opts, &mut summary),
+        Command::Kernel(kernel_opts) => run_kernel_flow(kernel_opts, &mut summary),
+        Command::Pwn(pwn_opts) => run_pwn_flow(pwn_opts, &mut summary),
     }
     Ok(summary)
 }
@@ -730,6 +939,68 @@ mod tests {
         image[0x202..0x206].copy_from_slice(b"HdrS");
         image.extend_from_slice(&compressed);
         image
+    }
+
+    #[test]
+    fn dry_run_mode_survives_input_resolution_failure() {
+        let workspace = tempfile::TempDir::new().expect("workspace");
+        for dry_run in [false, true] {
+            let mut opts = Opts::try_parse_from(["pwninit", "kernel"])
+                .expect("parse kernel command");
+            opts.dry_run = dry_run;
+            opts.cmd = Some(Command::Kernel(KernelOpts {
+                kernel: Some(workspace.path().join("bzImage")),
+                initramfs: Some(workspace.path().join("rootfs.cpio")),
+                debug_initramfs: Some(workspace.path().join("rootfs.cpio")),
+                run_script: Some(workspace.path().join("run.sh")),
+                ..KernelOpts::default()
+            }));
+
+            let summary = run_with_summary(opts).expect("return failure summary");
+            assert!(!summary.success());
+            assert_eq!(summary.steps[0].name, "resolve inputs");
+            assert_eq!(summary.dry_run, dry_run);
+        }
+    }
+
+    #[test]
+    fn kernel_plan_previews_missing_flags_and_preserves_existing_flags_with_force() {
+        let workspace = tempfile::TempDir::new().expect("workspace");
+        // A top-level relative path matches the launcher's supported flag disks.
+        let flag = tempfile::Builder::new()
+            .prefix("flag-pwninit-test-")
+            .tempfile_in(".")
+            .expect("flag fixture");
+        let flag_name = flag.path().file_name().expect("flag name").to_owned();
+        std::fs::write(flag.path(), b"existing flag").expect("write flag fixture");
+        let launcher = workspace.path().join("run.sh");
+        std::fs::write(
+            &launcher,
+            format!("qemu-system-x86_64 -hda ./{}\n", flag_name.to_string_lossy()),
+        )
+        .expect("write launcher");
+        let opts = KernelOpts {
+            run_script: Some(launcher),
+            force: true,
+            ..KernelOpts::default()
+        };
+        let mut summary = Summary::new("kernel");
+        plan_kernel(&opts, &mut summary);
+        let step = summary.steps.iter().find(|step| step.name == "create local flag")
+            .expect("flag plan");
+        assert!(matches!(step.status, output::StepStatus::Skipped));
+        assert!(!step.detail.contains("--force"));
+        assert_eq!(std::fs::read(flag.path()).unwrap(), b"existing flag");
+
+        // Remove only the fixture; the preview must leave the missing path absent.
+        flag.close().expect("remove flag fixture");
+        let mut summary = Summary::new("kernel");
+        plan_kernel(&opts, &mut summary);
+        let step = summary.steps.iter().find(|step| step.name == "create local flag")
+            .expect("flag plan");
+        assert!(matches!(step.status, output::StepStatus::Planned));
+        assert!(step.detail.contains(&*flag_name.to_string_lossy()));
+        assert!(!std::path::Path::new(&flag_name).exists());
     }
 
     #[test]
@@ -775,7 +1046,6 @@ mod tests {
         let exploit = workspace.path().join("exploit.c");
         let build = workspace.path().join("build-exploit.sh");
         let opts = Opts {
-            pwn: crate::opts::PwnOpts::default(),
             cmd: Some(Command::Kernel(KernelOpts {
                 kernel: Some(bzimage),
                 initramfs: Some(initramfs.clone()),
@@ -792,6 +1062,7 @@ mod tests {
             quiet: false,
             verbose: 0,
             json: false,
+            dry_run: false,
         };
 
         let summary = run_with_summary(opts).expect("run kernel flow");

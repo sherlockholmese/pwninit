@@ -34,7 +34,7 @@ pub use crate::fetch_libc::fetch_libc_lib;
 pub use crate::fetch_libc::fetch_libm;
 pub use crate::fetch_libc::fetch_libpthread;
 use crate::libc_version::LibcVersion;
-use crate::opts::{PwnOpts, RevOpts};
+use crate::opts::{PwnOpts, RevOpts, SkipStep};
 pub use crate::set_exec::set_exec;
 pub use crate::unstrip_libc::unstrip_libc;
 use crate::warn::Warn;
@@ -174,7 +174,7 @@ fn maybe_unstrip_libc<F>(
 where
     F: FnOnce(&Path, &LibcVersion) -> unstrip_libc::Result,
 {
-    if opts.no_unstrip {
+    if opts.skips(SkipStep::Unstrip) {
         Ok(())
     } else {
         unstrip(libc, ver)
@@ -386,7 +386,7 @@ mod tests {
     #[test]
     fn maybe_unstrip_libc_skips_when_disabled() {
         let opts = PwnOpts {
-            no_unstrip: true,
+            skip: vec![SkipStep::Unstrip],
             ..PwnOpts::default()
         };
         let called = Cell::new(false);

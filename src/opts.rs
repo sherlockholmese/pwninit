@@ -12,9 +12,8 @@ use crate::output;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::path::PathBuf;
-use std::str::FromStr;
 
-use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use colored::Color;
 use colored::Colorize;
 use derive_setters::Setters;
@@ -29,18 +28,43 @@ pub enum PatchMode {
     Manual,
 }
 
+/// How to rewrite the binary's interpreter and library paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum PatchStrategy {
+    /// Use `patchelf` to set RPATH and the interpreter (default).
     Patchelf,
+    /// Rewrite ELF bytes in place without `patchelf`.
     Manual,
-    None,
 }
 
+/// An optional setup step that `--skip` can turn off.
+///
+/// Not every step applies to every command; `validate` rejects a step that
+/// does not belong to the command it was given to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum FetchLibcSource {
-    Launchpad,
-    Docker,
-    Debian,
+pub enum SkipStep {
+    /// Downloading debug symbols and unstripping libc (pwn).
+    Unstrip,
+    /// Patching the binary's interpreter / library paths (pwn).
+    Patch,
+    /// Writing the solve-script / exploit template (pwn, rev, kernel).
+    Template,
+    /// Extracting `vmlinux` from the kernel image (kernel).
+    Vmlinux,
+    /// Copying kernel modules out of the initramfs (kernel).
+    Modules,
+}
+
+impl SkipStep {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unstrip => "unstrip",
+            Self::Patch => "patch",
+            Self::Template => "template",
+            Self::Vmlinux => "vmlinux",
+            Self::Modules => "modules",
+        }
+    }
 }
 
 /// Repository used to locate debug symbols while initializing a pwn challenge.
@@ -52,21 +76,6 @@ pub enum DebugSource {
     Debian,
 }
 
-impl FromStr for FetchLibcSource {
-    type Err = String;
-
-    fn from_str(source: &str) -> std::result::Result<Self, Self::Err> {
-        match source {
-            "launchpad" => Ok(Self::Launchpad),
-            "docker" => Ok(Self::Docker),
-            "debian" => Ok(Self::Debian),
-            _ => Err(format!(
-                "unknown fetch source: {}, expected launchpad, docker, or debian",
-                source
-            )),
-        }
-    }
-}
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -142,45 +151,94 @@ fn detect_path_if(
     Ok(if pred(&path)? { Some(path) } else { None })
 }
 
-/// Automate starting binary exploit and reverse engineering challenges
-#[derive(Parser, Clone)]
-#[command(version)]
-pub struct Opts {
-    /// Pwn challenge options used when no subcommand is provided
-    #[command(flatten)]
-    pub pwn: PwnOpts,
+const ROOT_EXAMPLES: &str = "\
+Examples:
+  pwninit                         Detect the challenge in this folder and set it up
+  pwninit --dry-run               Show what would happen without changing anything
+  pwninit pwn --uv                Pwn setup plus a .venv with pwntools
+  pwninit pwn --skip unstrip      Pwn setup without downloading debug symbols
+  pwninit rev                     Reverse-engineering setup (angr + z3 template)
+  pwninit kernel                  Kernel setup (unpack initramfs, vmlinux, run-debug.sh)
+  pwninit libc launchpad 2.31     Download Ubuntu glibc 2.31 into this folder
 
-    /// Challenge type to initialize
+Run `pwninit <COMMAND> --help` for the options of one command.";
+
+const PWN_EXAMPLES: &str = "\
+Examples:
+  pwninit pwn                                  Auto-detect binary, libc and ld
+  pwninit pwn -b ./chall -l ./libc.so.6        Name the files explicitly
+  pwninit pwn --uv                             Also create .venv with pwntools
+  pwninit pwn --skip unstrip,patch             Skip debug symbols and patching
+  pwninit pwn --patch-mode manual              Patch without patchelf";
+
+const REV_EXAMPLES: &str = "\
+Examples:
+  pwninit rev                    Auto-detect the binary, write solve.py
+  pwninit rev -b ./crackme --uv  Name the binary, create .venv with angr + z3";
+
+const KERNEL_EXAMPLES: &str = "\
+Examples:
+  pwninit kernel                                   Auto-detect kernel, initramfs, run script
+  pwninit kernel -k bzImage -i rootfs.cpio.gz      Name the inputs explicitly
+  pwninit kernel --skip vmlinux,modules            Only unpack and generate scripts
+
+Afterwards:
+  ./build-exploit.sh       Compile exploit.c and repack the debug initramfs
+  ./run-debug.sh           Boot with nokaslr nopti nosmep nosmap
+  GDB=1 ./run-debug.sh     Same, paused with a GDB server";
+
+const LIBC_EXAMPLES: &str = "\
+Examples:
+  pwninit libc launchpad 2.31 --lib libm.so.6
+  pwninit libc docker --image ubuntu:22.04
+  pwninit libc docker --distro debian --release bookworm
+  pwninit libc debian 2.36 --release bookworm";
+
+/// Set up pwn, rev, and kernel CTF challenges in one command
+///
+/// Run with no command in a challenge folder and pwninit detects what kind of
+/// challenge it is: a kernel image plus an initramfs means `kernel`, anything
+/// else means `pwn`. Reverse-engineering challenges need `pwninit rev`.
+#[derive(Parser, Clone)]
+#[command(version, after_help = ROOT_EXAMPLES)]
+pub struct Opts {
     #[command(subcommand)]
     pub cmd: Option<Command>,
 
     /// Suppress progress output
-    #[arg(short, long, global = true, conflicts_with = "verbose")]
+    #[arg(short, long, global = true, conflicts_with = "verbose", help_heading = "Global")]
     pub quiet: bool,
 
     /// Show additional diagnostic output
-    #[arg(short, long, global = true, action = ArgAction::Count)]
+    #[arg(short, long, global = true, action = ArgAction::Count, help_heading = "Global")]
     pub verbose: u8,
 
     /// Emit a machine-readable JSON result
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help_heading = "Global")]
     pub json: bool,
+
+    /// Show the planned steps without changing any files
+    #[arg(short = 'n', long, global = true, help_heading = "Global")]
+    pub dry_run: bool,
 }
 
-/// Challenge type to initialize (default: pwn)
 #[derive(Subcommand, Clone)]
 pub enum Command {
-    /// Binary exploitation challenge
+    /// Userspace exploitation: patch the binary, fetch ld/debug symbols, write solve.py
+    #[command(after_help = PWN_EXAMPLES)]
     Pwn(PwnOpts),
 
-    /// Reverse engineering challenge
+    /// Reverse engineering: write an angr + z3 solve.py
+    #[command(after_help = REV_EXAMPLES)]
     Rev(RevOpts),
 
-    /// Linux kernel exploitation challenge
+    /// Kernel exploitation: unpack initramfs, extract vmlinux, write debug QEMU scripts
+    #[command(after_help = KERNEL_EXAMPLES)]
     Kernel(KernelOpts),
 
-    /// Download a libc by version without a local libc file
-    FetchLibc(FetchLibcOpts),
+    /// Download a libc (and companion libraries) from launchpad, docker, or debian
+    #[command(after_help = LIBC_EXAMPLES)]
+    Libc(LibcCommand),
 }
 
 /// Options for pwn challenge initialization
@@ -188,76 +246,71 @@ pub enum Command {
 #[setters(generate = "false")]
 #[setters(prefix = "with_")]
 pub struct PwnOpts {
-    /// Path to the challenge binary (auto-detected if not set)
-    #[arg(short = 'b', long)]
+    /// Challenge binary [default: auto-detected]
+    #[arg(short = 'b', long, value_name = "PATH", help_heading = "Inputs")]
     #[setters(generate)]
     pub bin: Option<PathBuf>,
 
-    /// Path to the challenge libc (auto-detected if not set)
-    #[arg(short = 'l', long)]
+    /// Challenge libc [default: auto-detected, file name contains "libc"]
+    #[arg(short = 'l', long, value_name = "PATH", help_heading = "Inputs")]
     #[setters(generate)]
     pub libc: Option<PathBuf>,
 
-    /// Path to the ELF interpreter / dynamic linker (auto-detected if not set)
-    #[arg(short = 'd', long)]
+    /// Dynamic linker [default: auto-detected or downloaded to match libc]
+    #[arg(short = 'd', long, value_name = "PATH", help_heading = "Inputs")]
     #[setters(generate)]
     pub ld: Option<PathBuf>,
 
-    /// Path to a custom pwntools solve script template (uses built-in template if not set)
-    #[arg(short = 't', long)]
-    pub template_path: Option<PathBuf>,
+    /// Leave out steps, comma-separated: unstrip, patch, template
+    #[arg(
+        long,
+        value_enum,
+        value_delimiter = ',',
+        value_name = "STEP",
+        help_heading = "Steps",
+        hide_possible_values = true
+    )]
+    pub skip: Vec<SkipStep>,
 
-    /// Variable name for the binary in the solve script template
-    #[arg(long, default_value = "exe")]
-    pub template_bin_name: String,
+    /// How to patch the binary
+    #[arg(short = 'p', long, value_enum, value_name = "MODE", default_value = "patchelf", help_heading = "Steps")]
+    pub patch_mode: PatchStrategy,
 
-    /// Variable name for the libc in the solve script template
-    #[arg(long, default_value = "libc")]
-    pub template_libc_name: String,
+    /// Where to find glibc debug symbols
+    #[arg(long, value_enum, value_name = "SOURCE", default_value = "auto", help_heading = "Steps")]
+    pub debug_source: DebugSource,
 
-    /// Variable name for the linker in the solve script template
-    #[arg(long, default_value = "ld")]
-    pub template_ld_name: String,
-
-    /// Create a uv virtual environment with pwntools installed
-    #[arg(short = 'u', long)]
+    /// Create .venv with pwntools using uv
+    #[arg(short = 'u', long, help_heading = "Steps")]
     pub uv: bool,
 
-    /// Binary patching strategy
-    #[arg(short = 'p', long, value_enum)]
-    pub patch_mode: Option<PatchStrategy>,
+    /// Keep going after a step fails
+    #[arg(long, help_heading = "Steps")]
+    pub best_effort: bool,
 
-    /// Skip patching the binary entirely (deprecated: use --patch-mode none)
-    #[arg(long, hide = true, conflicts_with = "patch_mode")]
-    pub no_patch_bin: bool,
-
-    /// Use manual ELF byte patching (deprecated: use --patch-mode manual)
-    #[arg(long, hide = true, conflicts_with = "patch_mode")]
-    pub no_patchelf: bool,
-
-    /// Skip generating the solve script template
-    #[arg(long, conflicts_with = "solve_path")]
-    pub no_template: bool,
-
-    /// Path for the generated solve script
-    #[arg(short = 's', long, default_value = "solve.py")]
+    /// Where to write the solve script
+    #[arg(short = 's', long, value_name = "PATH", default_value = "solve.py", help_heading = "Solve script")]
     pub solve_path: PathBuf,
 
     /// Overwrite an existing solve script
-    #[arg(short = 'f', long, conflicts_with = "no_template")]
+    #[arg(short = 'f', long, help_heading = "Solve script")]
     pub force: bool,
 
-    /// Skip downloading debug symbols and unstripping libc
-    #[arg(long)]
-    pub no_unstrip: bool,
+    /// Custom solve script template [default: built-in pwntools template]
+    #[arg(short = 't', long, value_name = "PATH", help_heading = "Solve script")]
+    pub template_path: Option<PathBuf>,
 
-    /// Repository used to download glibc debug symbols
-    #[arg(long, value_enum, default_value = "auto")]
-    pub debug_source: DebugSource,
+    /// Template variable name for the binary
+    #[arg(long, value_name = "NAME", default_value = "exe", help_heading = "Solve script")]
+    pub template_bin_name: String,
 
-    /// Continue independent setup steps after a failure
-    #[arg(long)]
-    pub best_effort: bool,
+    /// Template variable name for the libc
+    #[arg(long, value_name = "NAME", default_value = "libc", help_heading = "Solve script")]
+    pub template_libc_name: String,
+
+    /// Template variable name for the linker
+    #[arg(long, value_name = "NAME", default_value = "ld", help_heading = "Solve script")]
+    pub template_ld_name: String,
 }
 
 /// Options for rev challenge initialization
@@ -265,38 +318,45 @@ pub struct PwnOpts {
 #[setters(generate = "false")]
 #[setters(prefix = "with_")]
 pub struct RevOpts {
-    /// Path to the challenge binary (auto-detected if not set)
-    #[arg(short = 'b', long)]
+    /// Challenge binary [default: auto-detected]
+    #[arg(short = 'b', long, value_name = "PATH", help_heading = "Inputs")]
     #[setters(generate)]
     pub bin: Option<PathBuf>,
 
-    /// Path to a custom angr solve script template (uses built-in template if not set)
-    #[arg(short = 't', long)]
-    pub template_path: Option<PathBuf>,
+    /// Leave out steps, comma-separated: template
+    #[arg(
+        long,
+        value_enum,
+        value_delimiter = ',',
+        value_name = "STEP",
+        help_heading = "Steps",
+        hide_possible_values = true
+    )]
+    pub skip: Vec<SkipStep>,
 
-    /// Variable name for the binary in the solve script template
-    #[arg(long, default_value = "exe")]
-    pub template_bin_name: String,
-
-    /// Create a uv virtual environment with angr + z3 installed
-    #[arg(short = 'u', long)]
+    /// Create .venv with angr + z3 using uv
+    #[arg(short = 'u', long, help_heading = "Steps")]
     pub uv: bool,
 
-    /// Skip generating the solve script template
-    #[arg(long, conflicts_with = "solve_path")]
-    pub no_template: bool,
+    /// Keep going after a step fails
+    #[arg(long, help_heading = "Steps")]
+    pub best_effort: bool,
 
-    /// Path for the generated solve script
-    #[arg(short = 's', long, default_value = "solve.py")]
+    /// Where to write the solve script
+    #[arg(short = 's', long, value_name = "PATH", default_value = "solve.py", help_heading = "Solve script")]
     pub solve_path: PathBuf,
 
     /// Overwrite an existing solve script
-    #[arg(short = 'f', long, conflicts_with = "no_template")]
+    #[arg(short = 'f', long, help_heading = "Solve script")]
     pub force: bool,
 
-    /// Continue independent setup steps after a failure
-    #[arg(long)]
-    pub best_effort: bool,
+    /// Custom solve script template [default: built-in angr template]
+    #[arg(short = 't', long, value_name = "PATH", help_heading = "Solve script")]
+    pub template_path: Option<PathBuf>,
+
+    /// Template variable name for the binary
+    #[arg(long, value_name = "NAME", default_value = "exe", help_heading = "Solve script")]
+    pub template_bin_name: String,
 }
 
 /// Options for Linux kernel exploitation challenge initialization
@@ -304,133 +364,179 @@ pub struct RevOpts {
 #[setters(generate = "false")]
 #[setters(prefix = "with_")]
 pub struct KernelOpts {
-    /// Path to the x86-64 kernel image or bzImage (auto-detected if not set)
-    #[arg(short = 'k', long)]
+    /// x86-64 kernel image or bzImage [default: auto-detected]
+    #[arg(short = 'k', long, value_name = "PATH", help_heading = "Inputs")]
     #[setters(generate)]
     pub kernel: Option<PathBuf>,
 
-    /// Path to the initramfs archive (auto-detected if not set)
-    #[arg(short = 'i', long)]
+    /// Initramfs archive [default: auto-detected]
+    #[arg(short = 'i', long, value_name = "PATH", help_heading = "Inputs")]
     #[setters(generate)]
     pub initramfs: Option<PathBuf>,
 
-    /// Path for the generated debug initramfs (derived from --initramfs if not set)
-    #[arg(long)]
-    #[setters(generate)]
-    pub debug_initramfs: Option<PathBuf>,
-
-    /// Path to an existing QEMU launcher (auto-detected if not set)
-    #[arg(short = 'r', long)]
+    /// Existing QEMU launch script [default: auto-detected *.sh calling qemu-system]
+    #[arg(short = 'r', long, value_name = "PATH", help_heading = "Inputs")]
     #[setters(generate)]
     pub run_script: Option<PathBuf>,
 
-    /// Directory for the unpacked initramfs
-    #[arg(long, default_value = "initramfs")]
-    pub rootfs_dir: PathBuf,
+    /// Leave out steps, comma-separated: vmlinux, modules, template
+    #[arg(
+        long,
+        value_enum,
+        value_delimiter = ',',
+        value_name = "STEP",
+        help_heading = "Steps",
+        hide_possible_values = true
+    )]
+    pub skip: Vec<SkipStep>,
 
-    /// Path for the extracted uncompressed kernel ELF
-    #[arg(long, default_value = "vmlinux")]
-    pub vmlinux_path: PathBuf,
-
-    /// Path for the generated no-mitigation QEMU launcher
-    #[arg(long, default_value = "run-debug.sh")]
-    pub debug_run_path: PathBuf,
-
-    /// Path for the generated exploit source
-    #[arg(short = 's', long, default_value = "exploit.c")]
-    pub exploit_path: PathBuf,
-
-    /// Path for the generated compile-and-repack helper
-    #[arg(long, default_value = "build-exploit.sh")]
-    pub build_path: PathBuf,
-
-    /// Directory for kernel modules exported from the initramfs
-    #[arg(long, default_value = "kernel_modules")]
-    pub modules_dir: PathBuf,
-
-    /// Path to a custom C exploit template
-    #[arg(short = 't', long)]
-    pub template_path: Option<PathBuf>,
-
-    /// Skip generating the exploit source
-    #[arg(long, conflicts_with = "template_path")]
-    pub no_template: bool,
-
-    /// Skip extracting vmlinux from the kernel image
-    #[arg(long)]
-    pub no_vmlinux: bool,
-
-    /// Skip copying kernel modules out of the initramfs
-    #[arg(long)]
-    pub no_export_modules: bool,
-
-    /// Overwrite known generated outputs
-    #[arg(short = 'f', long)]
+    /// Overwrite previously generated files
+    #[arg(short = 'f', long, help_heading = "Steps")]
     pub force: bool,
 
-    /// Continue independent setup steps after a failure
-    #[arg(long)]
+    /// Keep going after a step fails
+    #[arg(long, help_heading = "Steps")]
     pub best_effort: bool,
+
+    /// Custom C exploit template [default: built-in template]
+    #[arg(short = 't', long, value_name = "PATH", help_heading = "Steps")]
+    pub template_path: Option<PathBuf>,
+
+    /// Exploit source file
+    #[arg(short = 's', long, value_name = "PATH", default_value = "exploit.c", help_heading = "Output paths")]
+    pub exploit_path: PathBuf,
+
+    /// Writable copy of the initramfs [default: <initramfs>-debug.<ext>]
+    #[arg(long, value_name = "PATH", help_heading = "Output paths")]
+    #[setters(generate)]
+    pub debug_initramfs: Option<PathBuf>,
+
+    /// Unpacked root filesystem directory
+    #[arg(long, value_name = "DIR", default_value = "initramfs", help_heading = "Output paths")]
+    pub rootfs_dir: PathBuf,
+
+    /// Extracted kernel ELF
+    #[arg(long, value_name = "PATH", default_value = "vmlinux", help_heading = "Output paths")]
+    pub vmlinux_path: PathBuf,
+
+    /// No-mitigation QEMU launcher
+    #[arg(long, value_name = "PATH", default_value = "run-debug.sh", help_heading = "Output paths")]
+    pub debug_run_path: PathBuf,
+
+    /// Compile-and-repack helper
+    #[arg(long, value_name = "PATH", default_value = "build-exploit.sh", help_heading = "Output paths")]
+    pub build_path: PathBuf,
+
+    /// Exported kernel modules directory
+    #[arg(long, value_name = "DIR", default_value = "kernel_modules", help_heading = "Output paths")]
+    pub modules_dir: PathBuf,
 }
 
-/// Options for downloading a libc by version
+/// `pwninit libc <SOURCE>`: each source only takes the flags it understands.
 #[derive(Args, Clone)]
-pub struct FetchLibcOpts {
-    /// glibc version to download from Launchpad, e.g. "2.31"
-    pub version: Option<String>,
+pub struct LibcCommand {
+    #[command(subcommand)]
+    pub source: LibcSource,
+}
 
-    /// libc fetch backend
-    #[arg(long, default_value = "launchpad", value_enum)]
-    pub source: FetchLibcSource,
+/// Where to download the libc from
+#[derive(Subcommand, Clone)]
+pub enum LibcSource {
+    /// Ubuntu glibc packages from Launchpad, by version (e.g. 2.31)
+    Launchpad(LaunchpadOpts),
 
+    /// Copy the libc out of a Docker image (e.g. ubuntu:22.04)
+    Docker(DockerOpts),
+
+    /// Debian glibc packages from a Debian mirror, by version and release
+    Debian(DebianOpts),
+}
+
+/// Options shared by every libc source
+#[derive(Args, Clone)]
+pub struct LibcOutputOpts {
     /// Target architecture
-    #[arg(short = 'a', long, default_value = "amd64", value_enum)]
+    #[arg(short = 'a', long, value_name = "ARCH", default_value = "amd64", value_enum, help_heading = "Output")]
     pub arch: CpuArch,
 
-    /// Directory for all downloaded artifacts
-    #[arg(short = 'o', long, default_value = ".")]
+    /// Directory for everything downloaded
+    #[arg(short = 'o', long, value_name = "DIR", default_value = ".", help_heading = "Output")]
     pub output_dir: PathBuf,
 
-    /// File name or path for the downloaded libc
-    #[arg(
-        short = 'O',
-        long,
-        visible_alias = "output",
-        default_value = "libc.so.6"
-    )]
+    /// File name for the libc, relative to --output-dir
+    #[arg(long, value_name = "PATH", default_value = "libc.so.6", help_heading = "Output")]
     pub libc_output: PathBuf,
 
-    /// Additional libc package library to download (repeatable; accepts sonames like libm.so.6)
-    #[arg(short = 'L', long = "lib", value_name = "NAME")]
+    /// Also download this library from the libc package, e.g. libm.so.6 (repeatable)
+    #[arg(short = 'L', long = "lib", value_name = "NAME", help_heading = "Output")]
     pub extra_libs: Vec<String>,
 
-    /// Read additional required libraries from this binary
-    #[arg(short = 'b', long)]
+    /// Also download every glibc library this binary needs
+    #[arg(long, value_name = "PATH", help_heading = "Output")]
     pub from_bin: Option<PathBuf>,
+}
 
-    /// Docker image to extract libc files from, e.g. ubuntu:22.04
-    #[arg(short = 'i', long)]
-    pub image: Option<String>,
-
-    /// Docker image distro name, used with --release, e.g. ubuntu
-    #[arg(long)]
-    pub distro: Option<String>,
-
-    /// Docker image distro release/tag, used with --distro, e.g. 22.04
-    #[arg(short = 'r', long)]
-    pub release: Option<String>,
-
-    /// Debian repository base URL, used with --source debian
-    #[arg(long, default_value = "https://deb.debian.org/debian")]
-    pub repo_url: String,
-
-    /// Never prompt when multiple package versions match
-    #[arg(long)]
+/// Options for picking one package when several match
+#[derive(Args, Clone)]
+pub struct PackageSelectOpts {
+    /// Fail instead of prompting when several package versions match
+    #[arg(long, help_heading = "Version selection")]
     pub non_interactive: bool,
 
-    /// Select one exact package version without prompting
-    #[arg(long, value_name = "VERSION")]
+    /// Use this exact package version, e.g. 2.31-0ubuntu9.18
+    #[arg(long, value_name = "VERSION", help_heading = "Version selection")]
     pub exact_version: Option<String>,
+}
+
+#[derive(Args, Clone)]
+pub struct LaunchpadOpts {
+    /// glibc version, e.g. 2.31
+    pub version: String,
+
+    #[command(flatten)]
+    pub select: PackageSelectOpts,
+
+    #[command(flatten)]
+    pub output: LibcOutputOpts,
+}
+
+#[derive(Args, Clone)]
+#[command(group(ArgGroup::new("docker_image").required(true).args(["image", "distro"])))]
+pub struct DockerOpts {
+    /// Docker image, e.g. ubuntu:22.04
+    #[arg(long, conflicts_with_all = ["distro", "release"])]
+    pub image: Option<String>,
+
+    /// Distro name, used together with --release, e.g. debian
+    #[arg(long, requires = "release")]
+    pub distro: Option<String>,
+
+    /// Distro release, used together with --distro, e.g. bookworm
+    #[arg(long, requires = "distro")]
+    pub release: Option<String>,
+
+    #[command(flatten)]
+    pub output: LibcOutputOpts,
+}
+
+#[derive(Args, Clone)]
+pub struct DebianOpts {
+    /// glibc version prefix, e.g. 2.36
+    pub version: String,
+
+    /// Debian release, e.g. bookworm
+    #[arg(long)]
+    pub release: String,
+
+    /// Debian mirror base URL
+    #[arg(long, value_name = "URL", default_value = "https://deb.debian.org/debian")]
+    pub repo_url: String,
+
+    #[command(flatten)]
+    pub select: PackageSelectOpts,
+
+    #[command(flatten)]
+    pub output: LibcOutputOpts,
 }
 
 impl Default for PwnOpts {
@@ -444,13 +550,10 @@ impl Default for PwnOpts {
             template_libc_name: "libc".to_string(),
             template_ld_name: "ld".to_string(),
             uv: false,
-            patch_mode: None,
-            no_patch_bin: false,
-            no_patchelf: false,
-            no_template: false,
+            patch_mode: PatchStrategy::Patchelf,
+            skip: Vec::new(),
             solve_path: PathBuf::from("solve.py"),
             force: false,
-            no_unstrip: false,
             debug_source: DebugSource::Auto,
             best_effort: false,
         }
@@ -464,7 +567,7 @@ impl Default for RevOpts {
             template_path: None,
             template_bin_name: "exe".to_string(),
             uv: false,
-            no_template: false,
+            skip: Vec::new(),
             solve_path: PathBuf::from("solve.py"),
             force: false,
             best_effort: false,
@@ -486,9 +589,7 @@ impl Default for KernelOpts {
             build_path: PathBuf::from("build-exploit.sh"),
             modules_dir: PathBuf::from("kernel_modules"),
             template_path: None,
-            no_template: false,
-            no_vmlinux: false,
-            no_export_modules: false,
+            skip: Vec::new(),
             force: false,
             best_effort: false,
         }
@@ -496,34 +597,68 @@ impl Default for KernelOpts {
 }
 
 impl Opts {
-    pub fn validate(&self) -> std::result::Result<(), String> {
-        let validate_pwn = |opts: &PwnOpts| {
-            validate_python_identifier(&opts.template_bin_name)?;
-            validate_python_identifier(&opts.template_libc_name)?;
-            validate_python_identifier(&opts.template_ld_name)?;
-            if opts.template_bin_name == opts.template_libc_name
-                || opts.template_bin_name == opts.template_ld_name
-                || opts.template_libc_name == opts.template_ld_name
-            {
-                return Err("template binding names must be distinct".to_string());
-            }
-            if opts.no_patch_bin && opts.no_patchelf {
-                return Err("--no-patch-bin cannot be combined with --no-patchelf".to_string());
-            }
-            Ok(())
-        };
-
-        if self.cmd.is_some() && self.pwn.has_explicit_values() {
-            return Err(
-                "pwn options placed before a subcommand cannot be combined with an explicit subcommand"
-                    .to_string(),
-            );
+    /// Fill in the command for a bare `pwninit` run by looking at the
+    /// current directory: a kernel image plus an initramfs means `kernel`,
+    /// anything else means `pwn`.
+    pub fn with_resolved_command(mut self) -> Self {
+        if self.cmd.is_none() {
+            self.cmd = Some(autodetect_command());
         }
+        self
+    }
 
+    /// Short name of the command, as used in summaries and JSON output.
+    pub fn command_name(&self) -> &'static str {
         match &self.cmd {
-            Some(Command::Pwn(opts)) => validate_pwn(opts)?,
-            Some(Command::Rev(opts)) => validate_python_identifier(&opts.template_bin_name)?,
+            Some(Command::Pwn(_)) | None => "pwn",
+            Some(Command::Rev(_)) => "rev",
+            Some(Command::Kernel(_)) => "kernel",
+            Some(Command::Libc(_)) => "libc",
+        }
+    }
+
+    /// Checks that clap cannot express on its own.
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        match &self.cmd {
+            Some(Command::Pwn(opts)) => {
+                validate_skips(
+                    &opts.skip,
+                    &[SkipStep::Unstrip, SkipStep::Patch, SkipStep::Template],
+                    "pwn",
+                )?;
+                validate_template_skip(
+                    &opts.skip,
+                    opts.template_path.is_some(),
+                    &opts.solve_path,
+                )?;
+                validate_python_identifier(&opts.template_bin_name)?;
+                validate_python_identifier(&opts.template_libc_name)?;
+                validate_python_identifier(&opts.template_ld_name)?;
+                if opts.template_bin_name == opts.template_libc_name
+                    || opts.template_bin_name == opts.template_ld_name
+                    || opts.template_libc_name == opts.template_ld_name
+                {
+                    return Err("template variable names must be distinct".to_string());
+                }
+            }
+            Some(Command::Rev(opts)) => {
+                validate_skips(&opts.skip, &[SkipStep::Template], "rev")?;
+                validate_template_skip(
+                    &opts.skip,
+                    opts.template_path.is_some(),
+                    &opts.solve_path,
+                )?;
+                validate_python_identifier(&opts.template_bin_name)?;
+            }
             Some(Command::Kernel(opts)) => {
+                validate_skips(
+                    &opts.skip,
+                    &[SkipStep::Template, SkipStep::Vmlinux, SkipStep::Modules],
+                    "kernel",
+                )?;
+                if opts.skip.contains(&SkipStep::Template) && opts.template_path.is_some() {
+                    return Err("--template-path cannot be used with --skip template".to_string());
+                }
                 if let Some((first, second, path)) = kernel_path_conflict(opts) {
                     return Err(format!(
                         "kernel paths {first} and {second} both resolve to {}",
@@ -531,73 +666,27 @@ impl Opts {
                     ));
                 }
             }
-            Some(Command::FetchLibc(opts)) => {
-                const DEFAULT_REPO: &str = "https://deb.debian.org/debian";
-                match opts.source {
-                    FetchLibcSource::Launchpad => {
-                        if opts.version.is_none() {
-                            return Err("fetch-libc launchpad source requires VERSION".to_string());
-                        }
-                        if opts.image.is_some() || opts.distro.is_some() || opts.release.is_some() {
-                            return Err(
-                                "launchpad source does not accept --image, --distro, or --release"
-                                    .to_string(),
-                            );
-                        }
-                        if opts.repo_url != DEFAULT_REPO {
-                            return Err("launchpad source does not accept --repo-url".to_string());
-                        }
+            Some(Command::Libc(libc)) => {
+                let select = match &libc.source {
+                    LibcSource::Launchpad(opts) => Some(&opts.select),
+                    LibcSource::Debian(opts) => Some(&opts.select),
+                    LibcSource::Docker(_) => None,
+                };
+                if let Some(select) = select {
+                    if self.json && !select.non_interactive && select.exact_version.is_none() {
+                        return Err(
+                            "--json needs --non-interactive or --exact-version, since it cannot prompt"
+                                .to_string(),
+                        );
                     }
-                    FetchLibcSource::Docker => {
-                        if opts.version.is_some() {
-                            return Err("docker source does not accept VERSION".to_string());
-                        }
-                        if opts.exact_version.is_some() {
-                            return Err("docker source does not accept --exact-version".to_string());
-                        }
-                        if opts.repo_url != DEFAULT_REPO {
-                            return Err("docker source does not accept --repo-url".to_string());
-                        }
-                        let image = opts.image.is_some();
-                        let pair = opts.distro.is_some() && opts.release.is_some();
-                        if image == pair || (opts.distro.is_some() != opts.release.is_some()) {
-                            return Err(
-                                "docker source requires exactly one of --image or --distro with --release"
-                                    .to_string(),
-                            );
-                        }
-                    }
-                    FetchLibcSource::Debian => {
-                        if opts.version.is_none() {
-                            return Err("debian source requires VERSION".to_string());
-                        }
-                        if opts.release.is_none() {
-                            return Err("debian source requires --release".to_string());
-                        }
-                        if opts.image.is_some() || opts.distro.is_some() {
-                            return Err(
-                                "debian source does not accept --image or --distro".to_string()
-                            );
-                        }
-                    }
-                }
-                if self.json
-                    && opts.source != FetchLibcSource::Docker
-                    && !opts.non_interactive
-                    && opts.exact_version.is_none()
-                {
-                    return Err(
-                        "--json requires --non-interactive for package version selection"
-                            .to_string(),
-                    );
                 }
             }
-            None => validate_pwn(&self.pwn)?,
+            None => {}
         }
         Ok(())
     }
 
-    /// Print the locations of known files (binary, libc, linker)
+    /// Print the locations of known input files
     pub fn print(&self) {
         let f = |opt_path: &Option<PathBuf>, header: &str, color| {
             if let Some(path) = opt_path {
@@ -628,102 +717,82 @@ impl Opts {
                 );
                 f(&opts.run_script, "run", Color::Green);
             }
-            Some(Command::FetchLibc(_)) => {}
-            None => {
-                f(&self.pwn.bin, "bin", Color::BrightBlue);
-                f(&self.pwn.libc, "libc", Color::Yellow);
-                f(&self.pwn.ld, "ld", Color::Green);
-            }
+            Some(Command::Libc(_)) | None => {}
         }
     }
 
     /// For the unspecified files, try to guess their path
-    pub fn find_if_unspec(self) -> Result<Self> {
-        match self.cmd {
-            Some(Command::Pwn(opts)) => {
-                let opts = resolve_pwn(opts)?;
-                Ok(Opts {
-                    pwn: self.pwn,
-                    cmd: Some(Command::Pwn(opts)),
-                    quiet: self.quiet,
-                    verbose: self.verbose,
-                    json: self.json,
-                })
-            }
-            Some(Command::Rev(opts)) => {
-                let opts = resolve_rev(opts)?;
-                Ok(Opts {
-                    pwn: self.pwn,
-                    cmd: Some(Command::Rev(opts)),
-                    quiet: self.quiet,
-                    verbose: self.verbose,
-                    json: self.json,
-                })
-            }
-            Some(Command::Kernel(opts)) => {
-                let opts = resolve_kernel(opts)?;
-                Ok(Opts {
-                    pwn: self.pwn,
-                    cmd: Some(Command::Kernel(opts)),
-                    quiet: self.quiet,
-                    verbose: self.verbose,
-                    json: self.json,
-                })
-            }
-            Some(Command::FetchLibc(opts)) => Ok(Opts {
-                pwn: self.pwn,
-                cmd: Some(Command::FetchLibc(opts)),
-                quiet: self.quiet,
-                verbose: self.verbose,
-                json: self.json,
-            }),
-            None => {
-                let pwn = resolve_pwn(self.pwn)?;
-                Ok(Opts {
-                    pwn,
-                    cmd: None,
-                    quiet: self.quiet,
-                    verbose: self.verbose,
-                    json: self.json,
-                })
-            }
-        }
+    pub fn find_if_unspec(mut self) -> Result<Self> {
+        self.cmd = match self.cmd {
+            Some(Command::Pwn(opts)) => Some(Command::Pwn(resolve_pwn(opts)?)),
+            Some(Command::Rev(opts)) => Some(Command::Rev(resolve_rev(opts)?)),
+            Some(Command::Kernel(opts)) => Some(Command::Kernel(resolve_kernel(opts)?)),
+            other => other,
+        };
+        Ok(self)
     }
 }
 
+/// Pick `kernel` when the directory holds a kernel image and an initramfs,
+/// otherwise `pwn`.
+pub fn autodetect_command() -> Command {
+    match scan_kernel_current_dir(true, true, false) {
+        Ok(found) if !found.kernel.is_empty() && !found.initramfs.is_empty() => {
+            Command::Kernel(KernelOpts::default())
+        }
+        _ => Command::Pwn(PwnOpts::default()),
+    }
+}
+
+fn validate_skips(
+    skip: &[SkipStep],
+    allowed: &[SkipStep],
+    command: &str,
+) -> std::result::Result<(), String> {
+    if let Some(step) = skip.iter().find(|step| !allowed.contains(step)) {
+        let allowed = allowed
+            .iter()
+            .map(|step| step.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "`--skip {}` does not apply to `{command}`; possible steps: {allowed}",
+            step.as_str()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_template_skip(
+    skip: &[SkipStep],
+    has_template_path: bool,
+    solve_path: &Path,
+) -> std::result::Result<(), String> {
+    if !skip.contains(&SkipStep::Template) {
+        return Ok(());
+    }
+    if has_template_path {
+        return Err("--template-path cannot be used with --skip template".to_string());
+    }
+    if solve_path != Path::new("solve.py") {
+        return Err("--solve-path cannot be used with --skip template".to_string());
+    }
+    Ok(())
+}
+
 impl PwnOpts {
-    fn has_explicit_values(&self) -> bool {
-        self.bin.is_some()
-            || self.libc.is_some()
-            || self.ld.is_some()
-            || self.template_path.is_some()
-            || self.template_bin_name != "exe"
-            || self.template_libc_name != "libc"
-            || self.template_ld_name != "ld"
-            || self.uv
-            || self.patch_mode.is_some()
-            || self.no_patch_bin
-            || self.no_patchelf
-            || self.no_template
-            || self.solve_path != Path::new("solve.py")
-            || self.force
-            || self.no_unstrip
-            || self.debug_source != DebugSource::Auto
-            || self.best_effort
+    pub fn skips(&self, step: SkipStep) -> bool {
+        self.skip.contains(&step)
     }
 
     pub fn resolved_patch_mode(&self) -> Option<PatchMode> {
-        if self.no_patch_bin {
-            None
-        } else if self.no_patchelf {
-            Some(PatchMode::Manual)
-        } else {
-            match self.patch_mode.unwrap_or(PatchStrategy::Patchelf) {
-                PatchStrategy::Patchelf => Some(PatchMode::Patchelf),
-                PatchStrategy::Manual => Some(PatchMode::Manual),
-                PatchStrategy::None => None,
-            }
+        if self.skips(SkipStep::Patch) {
+            return None;
         }
+        Some(match self.patch_mode {
+            PatchStrategy::Patchelf => PatchMode::Patchelf,
+            PatchStrategy::Manual => PatchMode::Manual,
+        })
     }
 
     /// Re-scan the current directory for a linker if one is not already specified.
@@ -733,6 +802,18 @@ impl PwnOpts {
         }
         let detected = scan_current_dir()?;
         Ok(self.with_ld(select_candidate("linker", detected.ld)?))
+    }
+}
+
+impl RevOpts {
+    pub fn skips(&self, step: SkipStep) -> bool {
+        self.skip.contains(&step)
+    }
+}
+
+impl KernelOpts {
+    pub fn skips(&self, step: SkipStep) -> bool {
+        self.skip.contains(&step)
     }
 }
 
@@ -1046,290 +1127,263 @@ fn validate_python_identifier(value: &str) -> std::result::Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
 
-    #[test]
-    fn fetch_libc_accepts_repeated_extra_libs() {
-        let opts = Opts::try_parse_from([
-            "pwninit",
-            "fetch-libc",
-            "2.31",
-            "--lib",
-            "libm.so.6",
-            "--lib",
-            "libnss_dns.so.2",
-        ])
-        .expect("fetch-libc should parse repeated --lib values");
-
-        let Some(Command::FetchLibc(fetch_opts)) = opts.cmd else {
-            panic!("expected fetch-libc command");
-        };
-        assert_eq!(fetch_opts.extra_libs, ["libm.so.6", "libnss_dns.so.2"]);
-    }
-
-    #[test]
-    fn fetch_libc_defaults_to_no_extra_libs() {
-        let opts = Opts::try_parse_from(["pwninit", "fetch-libc", "2.31"])
-            .expect("fetch-libc should parse without --lib");
-
-        let Some(Command::FetchLibc(fetch_opts)) = opts.cmd else {
-            panic!("expected fetch-libc command");
-        };
-        assert!(fetch_opts.extra_libs.is_empty());
-    }
-
-    #[test]
-    fn pwn_flow_does_not_accept_extra_libs() {
-        assert!(Opts::try_parse_from(["pwninit", "--lib", "libm.so.6"]).is_err());
-    }
-
-    #[test]
-    fn pwn_no_unstrip_flag_parses() {
-        let opts =
-            Opts::try_parse_from(["pwninit", "--no-unstrip"]).expect("--no-unstrip should parse");
-
-        assert!(opts.pwn.no_unstrip);
-    }
-
-    #[test]
-    fn pwn_unstrip_is_enabled_by_default() {
-        let opts = Opts::try_parse_from(["pwninit"]).expect("default pwn flow should parse");
-
-        assert!(!opts.pwn.no_unstrip);
-    }
-
-    #[test]
-    fn pwn_debug_source_defaults_to_auto_and_accepts_explicit_sources() {
-        let defaults = Opts::try_parse_from(["pwninit"]).expect("default pwn flow should parse");
-        assert_eq!(defaults.pwn.debug_source, DebugSource::Auto);
-
-        for (value, expected) in [
-            ("launchpad", DebugSource::Launchpad),
-            ("debian", DebugSource::Debian),
-        ] {
-            let opts = Opts::try_parse_from(["pwninit", "pwn", "--debug-source", value])
-                .expect("explicit debug source should parse");
-            let Some(Command::Pwn(pwn_opts)) = opts.cmd else {
-                panic!("expected pwn command");
-            };
-            assert_eq!(pwn_opts.debug_source, expected);
-        }
-    }
-
-    #[test]
-    fn fetch_libc_does_not_accept_debug_source() {
-        assert!(Opts::try_parse_from([
-            "pwninit",
-            "fetch-libc",
-            "2.36",
-            "--debug-source",
-            "debian",
-        ])
-        .is_err());
-    }
-
-    // -------------------------------------------------------------------
-    // VAL-CLI-003: additional `fetch-libc` argument parsing coverage.
-    // -------------------------------------------------------------------
-
-    fn parse_fetch_libc(args: &[&str]) -> crate::opts::FetchLibcOpts {
-        let mut full = vec!["pwninit", "fetch-libc"];
+    fn parse(args: &[&str]) -> Opts {
+        let mut full = vec!["pwninit"];
         full.extend_from_slice(args);
-        let opts = Opts::try_parse_from(&full).expect("fetch-libc should parse");
-        match opts.cmd {
-            Some(Command::FetchLibc(fetch_opts)) => fetch_opts,
-            Some(Command::Rev(_)) => panic!("expected fetch-libc command, got rev"),
-            Some(Command::Kernel(_)) => panic!("expected fetch-libc command, got kernel"),
-            Some(Command::Pwn(_)) => panic!("expected fetch-libc command, got pwn"),
-            None => panic!("expected fetch-libc command, got default pwn"),
+        Opts::try_parse_from(&full).expect("arguments should parse")
+    }
+
+    fn parse_err(args: &[&str]) -> bool {
+        let mut full = vec!["pwninit"];
+        full.extend_from_slice(args);
+        Opts::try_parse_from(&full).is_err()
+    }
+
+    fn pwn(args: &[&str]) -> PwnOpts {
+        let mut full = vec!["pwn"];
+        full.extend_from_slice(args);
+        match parse(&full).cmd {
+            Some(Command::Pwn(opts)) => opts,
+            _ => panic!("expected pwn command"),
+        }
+    }
+
+    fn libc(args: &[&str]) -> LibcSource {
+        let mut full = vec!["libc"];
+        full.extend_from_slice(args);
+        match parse(&full).cmd {
+            Some(Command::Libc(cmd)) => cmd.source,
+            _ => panic!("expected libc command"),
         }
     }
 
     #[test]
-    fn fetch_libc_arch_amd64_parses() {
-        let fetch_opts = parse_fetch_libc(&["2.31", "--arch", "amd64"]);
-        assert_eq!(fetch_opts.arch, CpuArch::Amd64);
-        assert_eq!(fetch_opts.version.as_deref(), Some("2.31"));
+    fn clap_definition_is_consistent() {
+        Opts::command().debug_assert();
+    }
+
+    // ---- root / autodetect -------------------------------------------------
+
+    #[test]
+    fn bare_invocation_has_no_command_until_resolved() {
+        assert!(parse(&[]).cmd.is_none());
     }
 
     #[test]
-    fn fetch_libc_arch_i386_parses() {
-        let fetch_opts = parse_fetch_libc(&["2.31", "--arch", "i386"]);
-        assert_eq!(fetch_opts.arch, CpuArch::I386);
+    fn root_no_longer_accepts_pwn_flags() {
+        assert!(parse_err(&["--bin", "chall"]));
+        assert!(parse_err(&["--uv"]));
     }
 
     #[test]
-    fn fetch_libc_default_arch_is_amd64() {
-        let fetch_opts = parse_fetch_libc(&["2.31"]);
-        assert_eq!(fetch_opts.arch, CpuArch::Amd64);
+    fn global_flags_work_before_and_after_command() {
+        let opts = parse(&["--dry-run", "pwn"]);
+        assert!(opts.dry_run);
+        let opts = parse(&["pwn", "-n", "--json"]);
+        assert!(opts.dry_run && opts.json);
+    }
+
+    // ---- pwn ---------------------------------------------------------------
+
+    #[test]
+    fn pwn_defaults() {
+        let opts = pwn(&[]);
+        assert!(opts.skip.is_empty());
+        assert_eq!(opts.debug_source, DebugSource::Auto);
+        assert_eq!(opts.resolved_patch_mode(), Some(PatchMode::Patchelf));
     }
 
     #[test]
-    fn fetch_libc_invalid_arch_is_rejected() {
-        assert!(
-            Opts::try_parse_from(["pwninit", "fetch-libc", "2.31", "--arch", "armhf"]).is_err(),
-            "fetch-libc should reject architectures other than amd64 and i386"
+    fn pwn_skip_accepts_comma_list_and_repeats() {
+        let opts = pwn(&["--skip", "unstrip,patch", "--skip", "template"]);
+        assert!(opts.skips(SkipStep::Unstrip));
+        assert!(opts.skips(SkipStep::Patch));
+        assert!(opts.skips(SkipStep::Template));
+        assert_eq!(opts.resolved_patch_mode(), None);
+    }
+
+    #[test]
+    fn pwn_patch_mode_manual() {
+        assert_eq!(
+            pwn(&["--patch-mode", "manual"]).resolved_patch_mode(),
+            Some(PatchMode::Manual)
         );
     }
 
     #[test]
-    fn fetch_libc_output_path_is_preserved() {
-        let fetch_opts = parse_fetch_libc(&["2.31", "--output", "my/libc/path.so"]);
-        assert_eq!(fetch_opts.libc_output, PathBuf::from("my/libc/path.so"));
+    fn removed_flags_are_rejected() {
+        for flag in [
+            "--no-unstrip",
+            "--no-template",
+            "--no-patchelf",
+            "--no-patch-bin",
+        ] {
+            assert!(parse_err(&["pwn", flag]), "{flag} should be gone");
+        }
+        assert!(parse_err(&["pwn", "--patch-mode", "none"]));
+        assert!(parse_err(&["fetch-libc", "2.31"]));
     }
 
     #[test]
-    fn fetch_libc_default_output_is_libc_so_6() {
-        let fetch_opts = parse_fetch_libc(&["2.31"]);
-        assert_eq!(fetch_opts.libc_output, PathBuf::from("libc.so.6"));
-    }
-
-    #[test]
-    fn fetch_libc_positional_version_is_required() {
-        let opts = Opts::try_parse_from(["pwninit", "fetch-libc"])
-            .expect("conditional requirements are validated after parsing");
-        assert!(opts.validate().is_err());
-    }
-
-    #[test]
-    fn fetch_libc_combined_flags_parse_together() {
-        let fetch_opts = parse_fetch_libc(&[
-            "2.31",
-            "--arch",
-            "i386",
-            "--output",
-            "libc.so.6",
-            "--lib",
-            "libm.so.6",
-            "--lib",
-            "libdl.so.2",
-        ]);
-        assert_eq!(fetch_opts.version.as_deref(), Some("2.31"));
-        assert_eq!(fetch_opts.arch, CpuArch::I386);
-        assert_eq!(fetch_opts.libc_output, PathBuf::from("libc.so.6"));
-        assert_eq!(fetch_opts.extra_libs, ["libm.so.6", "libdl.so.2"]);
-    }
-
-    #[test]
-    fn fetch_libc_docker_image_source_parses_without_version() {
-        let fetch_opts = parse_fetch_libc(&["--source", "docker", "--image", "ubuntu:22.04"]);
-        assert_eq!(fetch_opts.source, FetchLibcSource::Docker);
-        assert!(fetch_opts.version.is_none());
-        assert_eq!(fetch_opts.image.as_deref(), Some("ubuntu:22.04"));
-    }
-
-    #[test]
-    fn fetch_libc_docker_distro_release_source_parses() {
-        let fetch_opts = parse_fetch_libc(&[
-            "--source",
-            "docker",
-            "--distro",
-            "debian",
-            "--release",
-            "bookworm",
-        ]);
-        assert_eq!(fetch_opts.source, FetchLibcSource::Docker);
-        assert_eq!(fetch_opts.distro.as_deref(), Some("debian"));
-        assert_eq!(fetch_opts.release.as_deref(), Some("bookworm"));
-    }
-
-    #[test]
-    fn fetch_libc_debian_source_parses_release_and_repo_url() {
-        let fetch_opts = parse_fetch_libc(&[
-            "2.36",
-            "--source",
-            "debian",
-            "--release",
-            "bookworm",
-            "--repo-url",
-            "https://deb.debian.org/debian",
-        ]);
-        assert_eq!(fetch_opts.source, FetchLibcSource::Debian);
-        assert_eq!(fetch_opts.version.as_deref(), Some("2.36"));
-        assert_eq!(fetch_opts.release.as_deref(), Some("bookworm"));
-        assert_eq!(fetch_opts.repo_url, "https://deb.debian.org/debian");
-    }
-
-    #[test]
-    fn pwn_flow_does_not_accept_fetch_libc_only_flags() {
-        // `--arch` belongs to `fetch-libc`, not the pwn flow. A user
-        // passing it to the default pwn flow must get a parse error.
-        assert!(
-            Opts::try_parse_from(["pwninit", "--arch", "amd64"]).is_err(),
-            "pwn flow should not accept --arch"
+    fn pwn_debug_source_accepts_explicit_sources() {
+        assert_eq!(
+            pwn(&["--debug-source", "launchpad"]).debug_source,
+            DebugSource::Launchpad
         );
-        // `--output` is also fetch-libc-only.
-        assert!(
-            Opts::try_parse_from(["pwninit", "--output", "libc.so.6"]).is_err(),
-            "pwn flow should not accept --output"
+        assert_eq!(
+            pwn(&["--debug-source", "debian"]).debug_source,
+            DebugSource::Debian
         );
     }
 
     #[test]
-    fn rev_subcommand_does_not_accept_fetch_libc_flags() {
-        assert!(
-            Opts::try_parse_from(["pwninit", "rev", "--lib", "libm.so.6"]).is_err(),
-            "rev should not accept --lib"
-        );
-        assert!(
-            Opts::try_parse_from(["pwninit", "rev", "--arch", "amd64"]).is_err(),
-            "rev should not accept --arch"
-        );
+    fn skip_steps_are_checked_per_command() {
+        assert!(parse(&["pwn", "--skip", "vmlinux"]).validate().is_err());
+        assert!(parse(&["rev", "--skip", "patch"]).validate().is_err());
+        assert!(parse(&["kernel", "--skip", "unstrip"]).validate().is_err());
+        assert!(parse(&["kernel", "--skip", "vmlinux,modules"]).validate().is_ok());
     }
 
     #[test]
-    fn fetch_libc_lib_outside_subcommand_is_rejected() {
-        // `--lib` lives under `fetch-libc`; passing it to `rev` or to the
-        // pwn flow must fail parsing.
-        assert!(Opts::try_parse_from(["pwninit", "rev", "--lib", "libm.so.6"]).is_err());
-        assert!(Opts::try_parse_from(["pwninit", "--lib", "libm.so.6"]).is_err());
-    }
-
-    #[test]
-    fn explicit_pwn_subcommand_parses() {
-        let opts = Opts::try_parse_from(["pwninit", "pwn", "--patch-mode", "manual"])
-            .expect("explicit pwn command should parse");
-        let Some(Command::Pwn(pwn)) = opts.cmd else {
-            panic!("expected explicit pwn command");
-        };
-        assert_eq!(pwn.resolved_patch_mode(), Some(PatchMode::Manual));
-    }
-
-    #[test]
-    fn legacy_and_explicit_command_options_cannot_mix() {
-        let opts = Opts::try_parse_from(["pwninit", "--bin", "a", "pwn"])
-            .expect("clap accepts legacy root options before normalization");
-        assert!(opts.validate().is_err());
+    fn skip_template_conflicts_with_template_options() {
+        assert!(parse(&["pwn", "--skip", "template", "-s", "x.py"])
+            .validate()
+            .is_err());
+        assert!(parse(&["rev", "--skip", "template", "-t", "t.py"])
+            .validate()
+            .is_err());
+        assert!(parse(&["kernel", "--skip", "template", "-t", "t.c"])
+            .validate()
+            .is_err());
     }
 
     #[test]
     fn invalid_python_identifiers_are_rejected() {
-        let opts = Opts::try_parse_from(["pwninit", "pwn", "--template-bin-name", "not-valid"])
-            .expect("identifier validation occurs after parsing");
-        assert!(opts.validate().is_err());
-
-        let opts = Opts::try_parse_from(["pwninit", "rev", "--template-bin-name", "class"])
-            .expect("keyword validation occurs after parsing");
-        assert!(opts.validate().is_err());
+        assert!(parse(&["pwn", "--template-bin-name", "not-valid"])
+            .validate()
+            .is_err());
+        assert!(parse(&["rev", "--template-bin-name", "class"])
+            .validate()
+            .is_err());
+        assert!(parse(&["pwn", "--template-bin-name", "libc"])
+            .validate()
+            .is_err());
     }
 
     #[test]
-    fn fetch_backend_combinations_are_validated() {
-        let docker = Opts::try_parse_from([
-            "pwninit",
-            "fetch-libc",
-            "2.31",
-            "--source",
-            "docker",
-            "--image",
-            "ubuntu:22.04",
-        ])
-        .expect("conditional validation occurs after parsing");
-        assert!(docker.validate().is_err());
-
-        let debian = Opts::try_parse_from(["pwninit", "fetch-libc", "2.36", "--source", "debian"])
-            .expect("conditional validation occurs after parsing");
-        assert!(debian.validate().is_err());
+    fn libc_only_flags_are_not_pwn_or_rev_flags() {
+        assert!(parse_err(&["pwn", "--lib", "libm.so.6"]));
+        assert!(parse_err(&["pwn", "--arch", "amd64"]));
+        assert!(parse_err(&["rev", "--lib", "libm.so.6"]));
     }
+
+    // ---- libc --------------------------------------------------------------
+
+    #[test]
+    fn libc_requires_a_source() {
+        assert!(parse_err(&["libc"]));
+        assert!(parse_err(&["libc", "2.31"]));
+    }
+
+    #[test]
+    fn libc_launchpad_parses_with_defaults() {
+        let LibcSource::Launchpad(opts) = libc(&["launchpad", "2.31"]) else {
+            panic!("expected launchpad");
+        };
+        assert_eq!(opts.version, "2.31");
+        assert_eq!(opts.output.arch, CpuArch::Amd64);
+        assert_eq!(opts.output.libc_output, PathBuf::from("libc.so.6"));
+        assert_eq!(opts.output.output_dir, PathBuf::from("."));
+        assert!(opts.output.extra_libs.is_empty());
+    }
+
+    #[test]
+    fn libc_launchpad_requires_version() {
+        assert!(parse_err(&["libc", "launchpad"]));
+    }
+
+    #[test]
+    fn libc_launchpad_full_flags() {
+        let LibcSource::Launchpad(opts) = libc(&[
+            "launchpad",
+            "2.31",
+            "-a",
+            "i386",
+            "--lib",
+            "libm.so.6",
+            "-L",
+            "libdl.so.2",
+            "--libc-output",
+            "my.so",
+            "--exact-version",
+            "2.31-0ubuntu9.18",
+        ]) else {
+            panic!("expected launchpad");
+        };
+        assert_eq!(opts.output.arch, CpuArch::I386);
+        assert_eq!(opts.output.extra_libs, ["libm.so.6", "libdl.so.2"]);
+        assert_eq!(opts.output.libc_output, PathBuf::from("my.so"));
+        assert_eq!(opts.select.exact_version.as_deref(), Some("2.31-0ubuntu9.18"));
+    }
+
+    #[test]
+    fn libc_rejects_invalid_arch() {
+        assert!(parse_err(&["libc", "launchpad", "2.31", "--arch", "armhf"]));
+    }
+
+    #[test]
+    fn libc_sources_reject_each_others_flags() {
+        assert!(parse_err(&["libc", "launchpad", "2.31", "--image", "ubuntu"]));
+        assert!(parse_err(&["libc", "launchpad", "2.31", "--release", "x"]));
+        assert!(parse_err(&["libc", "docker", "--image", "u", "--exact-version", "1"]));
+        assert!(parse_err(&["libc", "debian", "2.36", "--release", "b", "--image", "u"]));
+    }
+
+    #[test]
+    fn libc_docker_needs_image_or_distro_release() {
+        assert!(parse_err(&["libc", "docker"]));
+        assert!(parse_err(&["libc", "docker", "--distro", "debian"]));
+        assert!(parse_err(&["libc", "docker", "--release", "bookworm"]));
+        assert!(parse_err(&[
+            "libc", "docker", "--image", "u:22.04", "--distro", "debian", "--release", "b"
+        ]));
+
+        let LibcSource::Docker(opts) = libc(&["docker", "--image", "ubuntu:22.04"]) else {
+            panic!("expected docker");
+        };
+        assert_eq!(opts.image.as_deref(), Some("ubuntu:22.04"));
+
+        let LibcSource::Docker(opts) =
+            libc(&["docker", "--distro", "debian", "--release", "bookworm"])
+        else {
+            panic!("expected docker");
+        };
+        assert_eq!(opts.distro.as_deref(), Some("debian"));
+        assert_eq!(opts.release.as_deref(), Some("bookworm"));
+    }
+
+    #[test]
+    fn libc_debian_requires_release() {
+        assert!(parse_err(&["libc", "debian", "2.36"]));
+        let LibcSource::Debian(opts) = libc(&["debian", "2.36", "--release", "bookworm"]) else {
+            panic!("expected debian");
+        };
+        assert_eq!(opts.release, "bookworm");
+        assert_eq!(opts.repo_url, "https://deb.debian.org/debian");
+    }
+
+    #[test]
+    fn libc_json_needs_non_interactive_selection() {
+        assert!(parse(&["--json", "libc", "launchpad", "2.31"]).validate().is_err());
+        assert!(parse(&["--json", "libc", "launchpad", "2.31", "--non-interactive"])
+            .validate()
+            .is_ok());
+        assert!(parse(&["--json", "libc", "docker", "--image", "u"]).validate().is_ok());
+    }
+
+    // ---- kernel ------------------------------------------------------------
 
     #[test]
     fn ambiguous_candidates_are_sorted_in_error() {
@@ -1340,8 +1394,7 @@ mod tests {
 
     #[test]
     fn kernel_command_parses_full_development_setup_defaults() {
-        let opts = Opts::try_parse_from(["pwninit", "kernel"]).expect("kernel should parse");
-        let Some(Command::Kernel(kernel)) = opts.cmd else {
+        let Some(Command::Kernel(kernel)) = parse(&["kernel"]).cmd else {
             panic!("expected kernel command");
         };
         assert_eq!(kernel.rootfs_dir, PathBuf::from("initramfs"));
@@ -1349,25 +1402,22 @@ mod tests {
         assert_eq!(kernel.debug_run_path, PathBuf::from("run-debug.sh"));
         assert_eq!(kernel.exploit_path, PathBuf::from("exploit.c"));
         assert_eq!(kernel.build_path, PathBuf::from("build-exploit.sh"));
-        assert!(!kernel.no_template);
-        assert!(!kernel.no_vmlinux);
-        assert!(!kernel.no_export_modules);
+        assert!(kernel.skip.is_empty());
     }
 
     #[test]
     fn kernel_command_accepts_bzimage_and_debug_initramfs_paths() {
-        let opts = Opts::try_parse_from([
-            "pwninit",
+        let Some(Command::Kernel(kernel)) = parse(&[
             "kernel",
-            "--kernel",
+            "-k",
             "bzImage",
-            "--initramfs",
+            "-i",
             "initramfs.cpio.gz",
             "--debug-initramfs",
             "initramfs-debug.cpio.gz",
         ])
-        .expect("kernel paths should parse");
-        let Some(Command::Kernel(kernel)) = opts.cmd else {
+        .cmd
+        else {
             panic!("expected kernel command");
         };
         assert_eq!(kernel.kernel, Some(PathBuf::from("bzImage")));
@@ -1391,23 +1441,22 @@ mod tests {
 
     #[test]
     fn kernel_rejects_same_original_and_debug_initramfs() {
-        let opts = Opts::try_parse_from([
-            "pwninit",
+        assert!(parse(&[
             "kernel",
             "--initramfs",
             "rootfs.cpio",
             "--debug-initramfs",
             "rootfs.cpio",
         ])
-        .expect("paths parse before validation");
-        assert!(opts.validate().is_err());
+        .validate()
+        .is_err());
     }
 
     #[test]
     fn kernel_rejects_generated_output_path_collisions() {
-        let opts = Opts::try_parse_from(["pwninit", "kernel", "--exploit-path", "run-debug.sh"])
-            .expect("paths parse before validation");
-        assert!(opts.validate().is_err());
+        assert!(parse(&["kernel", "--exploit-path", "run-debug.sh"])
+            .validate()
+            .is_err());
     }
 
     #[test]

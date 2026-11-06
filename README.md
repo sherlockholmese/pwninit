@@ -11,16 +11,19 @@ A tool for automating userspace and Linux kernel exploit challenges, as well as 
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Features](#features)
+- [Commands at a Glance](#commands-at-a-glance)
 - [Usage](#usage)
   - [Pwn Challenges](#pwn-challenges)
   - [Kernel Pwn Challenges](#kernel-pwn-challenges)
   - [Reverse Engineering Challenges](#reverse-engineering-challenges)
-  - [Fetching Additional Libraries](#fetching-additional-libraries)
+  - [Downloading a libc](#downloading-a-libc)
 - [Advanced Configuration](#advanced-configuration)
+  - [Skipping Steps](#skipping-steps)
   - [Virtual Environments](#virtual-environments)
   - [Patching Modes](#patching-modes)
   - [Custom Templates](#custom-templates)
   - [Output and Automation](#output-and-automation)
+- [Migrating from v4](#migrating-from-v4)
 
 ## Installation
 
@@ -34,29 +37,36 @@ The compiled binary will be available in the `target/release` directory.
 
 ## Quick Start
 
-Run `pwninit` in a directory containing your challenge files. It will automatically detect the binary and libc, fetch the appropriate linker, patch the binary, and generate a solve script.
+Run `pwninit` in the folder that holds your challenge files. It works out what
+kind of challenge it is (a kernel image plus an initramfs means a kernel
+challenge, anything else a userspace pwn challenge) and sets it up.
 
-```sh
+Not sure what it will do? Add `--dry-run` (`-n`) to see the plan first. Nothing
+is changed:
+
+```text
 $ ls
-hunter  libc.so.6  readme
+chall  libc.so.6
 
-$ pwninit pwn
-bin: ./hunter
+$ pwninit --dry-run
+bin: ./chall
 libc: ./libc.so.6
 
-setting ./hunter executable
-fetching linker
-https://launchpad.net/ubuntu/+archive/primary/+files//libc6_2.23-0ubuntu10_i386.deb
-unstripping libc
-https://launchpad.net/ubuntu/+archive/primary/+files//libc6-dbg_2.23-0ubuntu10_i386.deb
-setting ./ld-2.23.so executable
-copying ./hunter to ./hunter_patched
-running patchelf on ./hunter_patched
-writing solve.py stub
+plan (dry run, nothing was changed)
+→ prepare binary: make ./chall executable
+→ prepare libc: inspect ./libc.so.6, download a matching linker, download debug symbols and unstrip
+→ prepare linker: make the downloaded linker executable
+- create environment: --uv was not requested
+→ patch binary: write ./chall_patched using patchelf
+→ generate solve script: write solve.py
 
-$ ls
-hunter	hunter_patched	ld-2.23.so  libc.so.6  readme  solve.py
+Run again without --dry-run to apply.
+
+$ pwninit
 ```
+
+Every command has examples at the bottom of its help: `pwninit --help`,
+`pwninit pwn --help`, `pwninit libc docker --help`, and so on.
 
 ## Features
 
@@ -69,50 +79,63 @@ hunter	hunter_patched	ld-2.23.so  libc.so.6  readme  solve.py
 - Generates template solve scripts for both `pwntools` and `angr` / `z3`.
 - Supports creating local `uv` virtual environments (`.venv`) for python dependencies.
 
+## Commands at a Glance
+
+```text
+pwninit                      detect the challenge type here and set it up
+pwninit pwn                  userspace exploitation
+pwninit rev                  reverse engineering
+pwninit kernel               kernel exploitation
+pwninit libc launchpad VER   download Ubuntu glibc VER
+pwninit libc docker ...      copy libc out of a Docker image
+pwninit libc debian VER ...  download Debian glibc VER
+
+Global flags (any command): -n/--dry-run  -q/--quiet  -v/--verbose  --json
+```
+
+Flags are grouped in each command's help as **Inputs** (files pwninit reads),
+**Steps** (what it does), and **Solve script** / **Output paths** (what it
+writes). Short flags mean the same thing everywhere: `-b` binary, `-t` template,
+`-s` main output file, `-f` force, `-u` uv, `-o` output directory.
+
 ## Usage
 
 ### Pwn Challenges
-
-Run the `pwn` subcommand in a directory with the relevant files. It automatically detects the binary, libc, and linker.
 
 ```sh
 pwninit pwn
 ```
 
-Bare `pwninit` remains supported for compatibility and performs the same pwn workflow.
-
-If the automatic detection is incorrect, you can manually specify the file paths:
+Bare `pwninit` does the same when the folder has no kernel files. pwninit finds
+the binary, libc, and linker by name: the libc contains `libc`, the linker
+contains `ld-`, and the binary is any other ELF. Name them yourself if detection
+picks the wrong file or finds more than one:
 
 ```sh
-pwninit pwn --bin ./challenge_bin --libc ./libc.so.6 --ld ./ld-linux.so.2
+pwninit pwn -b ./challenge_bin -l ./libc.so.6 -d ./ld-linux.so.2
 ```
 
-During pwn initialization, debug symbols are selected automatically based on the detected glibc package and expanded for every local ELF `.so` file. Override the repository when needed with `--debug-source`:
+Debug symbols are chosen from the detected glibc package and applied to every
+local `.so` file. Pick the repository with `--debug-source`:
 
 ```sh
 pwninit pwn --debug-source launchpad
 pwninit pwn --debug-source debian
 ```
 
-If the exact debug package is unavailable, pwninit automatically falls back to
-the selected distribution's debuginfod service and looks up symbols by ELF
-build ID.
-
-Use `--no-unstrip` to skip downloading debug symbols entirely. The standalone `fetch-libc` command only downloads packaged runtime files and does not unstrip them.
-
-The command fails before changing files when no binary is found. If multiple candidate binaries, libcs, or linkers are present, specify the intended path explicitly instead of relying on directory order.
+If the exact debug package is unavailable, pwninit falls back to the
+distribution's debuginfod service and looks up symbols by ELF build ID. Use
+`--skip unstrip` to skip debug symbols entirely.
 
 ### Kernel Pwn Challenges
-
-Run the `kernel` subcommand in a directory containing an x86-64 `vmlinuz` or
-`bzImage` and an initramfs:
 
 ```sh
 pwninit kernel
 ```
 
-The kernel workflow detects the challenge files and creates a development
-layout without modifying the supplied kernel, initramfs, or QEMU launcher:
+Bare `pwninit` does the same when it finds an x86-64 `vmlinuz`/`bzImage` and an
+initramfs. The kernel workflow creates a development layout without modifying
+the supplied kernel, initramfs, or QEMU launcher:
 
 ```text
 vmlinuz                       original kernel image
@@ -126,9 +149,9 @@ exploit.c                     static C exploit template
 build-exploit.sh              compile and repack helper
 ```
 
-`run-debug.sh` preserves the challenge's QEMU options where possible, switches
-the initrd to the debug archive, and adds `nokaslr nopti nosmep nosmap`. Start
-QEMU paused with a GDB server by setting `GDB=1`:
+`run-debug.sh` keeps the challenge's QEMU options where possible, switches the
+initrd to the debug archive, and adds `nokaslr nopti nosmep nosmap`. Set `GDB=1`
+to start QEMU paused with a GDB server:
 
 ```sh
 ./run-debug.sh
@@ -142,157 +165,175 @@ Build the generated Intel-syntax exploit and repack only the debug initramfs:
 ```
 
 The helper defaults to `gcc -static`. Override `CC`, `CFLAGS`, or
-`EXPLOIT_NAME` through the environment. It requires `cpio` and the
-compressor used by the original archive.
+`EXPLOIT_NAME` through the environment. It requires `cpio` and the compressor
+used by the original archive.
 
 Plain newc CPIO and gzip, xz, legacy lzma, bzip2, zstd, modern lz4, and legacy
-lz4 compression are supported. Existing generated files are preserved unless
-`--force` is supplied. Kernel modules are copied into `kernel_modules/`, rather
-than into the challenge root.
+lz4 compression are supported. Existing generated files are kept unless
+`--force` is given.
 
-Specify ambiguous or non-standard paths explicitly:
+Name ambiguous or non-standard inputs explicitly:
 
 ```sh
-pwninit kernel \
-    --kernel ./bzImage \
-    --initramfs ./rootfs.cpio.xz \
-    --debug-initramfs ./rootfs-debug.cpio.xz \
-    --run-script ./start.sh
+pwninit kernel -k ./bzImage -i ./rootfs.cpio.xz -r ./start.sh
 ```
 
-Use `--no-template`, `--no-vmlinux`, or `--no-export-modules` to skip optional
-artifacts. Output locations can be changed with `--rootfs-dir`,
-`--vmlinux-path`, `--debug-run-path`, `--exploit-path`, `--build-path`, and
-`--modules-dir`.
+Use `--skip vmlinux,modules,template` to leave out optional artifacts. Every
+output location can be changed; see the **Output paths** section of
+`pwninit kernel --help`.
 
 ### Reverse Engineering Challenges
 
-For reverse engineering tasks, run the `rev` subcommand. It will detect the reverse engineering binary and generate an `angr` + `z3` template.
+pwn and rev binaries look the same, so rev always needs its command:
 
 ```sh
 pwninit rev
+pwninit rev -b ./challenge_bin
 ```
 
-Manual binary specification is also supported:
+This makes the binary executable and writes an `angr` + `z3` `solve.py`.
+
+### Downloading a libc
+
+`pwninit libc` takes the source as a subcommand, and each source only accepts
+its own flags:
 
 ```sh
-pwninit rev --bin ./challenge_bin
+pwninit libc launchpad 2.31 --lib libm.so.6
+pwninit libc docker --image ubuntu:22.04
+pwninit libc docker --distro debian --release bookworm
+pwninit libc debian 2.36 --release bookworm
 ```
 
-### Fetching Additional Libraries
+These options work with every source:
 
-The `fetch-libc` subcommand supports Launchpad, Docker, and Debian sources. Launchpad is the default:
+| Flag | Meaning |
+|---|---|
+| `-a, --arch` | `amd64` (default) or `i386` |
+| `-o, --output-dir` | directory for everything downloaded (default `.`) |
+| `--libc-output` | libc file name inside that directory (default `libc.so.6`) |
+| `-L, --lib NAME` | also download this library from the libc package; repeatable. Accepts sonames (`libm.so.6`) and aliases (`libm`, `libpthread`) |
+| `--from-bin PATH` | also download every glibc library this binary needs |
+
+When several package versions match, `launchpad` and `debian` prompt for one.
+For scripts, disable the prompt or pick the exact version:
 
 ```sh
-pwninit fetch-libc 2.31 --lib libm.so.6
+pwninit libc launchpad 2.31 --non-interactive
+pwninit libc launchpad 2.31 --exact-version 2.31-0ubuntu9.18
 ```
 
-Use Docker by supplying an image or a distro/release pair:
-
-```sh
-pwninit fetch-libc --source docker --image ubuntu:22.04
-pwninit fetch-libc --source docker --distro debian --release bookworm
-```
-
-Use a Debian repository by supplying both a version prefix and release:
-
-```sh
-pwninit fetch-libc 2.36 --source debian --release bookworm
-```
-
-When multiple package versions match, the Launchpad and Debian sources prompt for a selection. For scripts, disable prompts and optionally select the complete package version:
-
-```sh
-pwninit fetch-libc 2.31 --non-interactive
-pwninit fetch-libc 2.31 --exact-version 2.31-0ubuntu9.18
-```
-
-An ambiguous `--non-interactive` lookup fails and lists the available versions. EOF during an interactive selection also produces an error instead of retrying indefinitely.
-
-`--lib` is repeatable and accepts sonames such as `libm.so.6`, `libdl.so.2`, or `libnss_dns.so.2`. Aliases such as `libm` and `libpthread` are normalized automatically. Use `--from-bin` to inspect one binary and fetch its missing glibc package dependencies explicitly:
-
-```sh
-pwninit fetch-libc 2.31 --from-bin ./challenge
-```
-
-Place every downloaded artifact in one directory with `--output-dir`. Use `--libc-output` to change the libc path relative to that directory:
-
-```sh
-pwninit fetch-libc 2.31 --output-dir ./runtime --libc-output libc-custom.so.6
-```
-
-The previous `--output` option remains an alias for `--libc-output`.
+An ambiguous `--non-interactive` lookup fails and lists the available versions.
+`pwninit libc` only downloads runtime files; it does not unstrip them.
 
 ## Advanced Configuration
 
+### Skipping Steps
+
+Every optional step is turned off the same way, with `--skip` and a
+comma-separated list:
+
+| Command | Steps you can skip |
+|---|---|
+| `pwn` | `unstrip`, `patch`, `template` |
+| `rev` | `template` |
+| `kernel` | `vmlinux`, `modules`, `template` |
+
+```sh
+pwninit pwn --skip unstrip,patch
+pwninit kernel --skip modules
+```
+
 ### Virtual Environments
 
-You can instruct `pwninit` to automatically create a local `uv` virtual environment in `.venv` and install required packages (`pwntools` for pwn, `angr` + `z3-solver` for rev).
+`--uv` (`-u`) creates a local `uv` virtual environment in `.venv` and installs
+`pwntools` (pwn) or `angr` + `z3-solver` (rev). By default, no environment is
+created.
 
 ```sh
 pwninit pwn --uv
 ```
 
-By default, no virtual environment is created.
-
 ### Patching Modes
 
-Select the patching strategy with `--patch-mode`:
-
 ```sh
-pwninit pwn --patch-mode patchelf
+pwninit pwn --patch-mode patchelf   # default
 pwninit pwn --patch-mode manual
-pwninit pwn --patch-mode none
+pwninit pwn --skip patch            # don't patch at all
 ```
 
-The default `patchelf` mode sets the `RPATH` to `.` whenever local shared libraries are present and sets the interpreter to `./ld`. Manual mode rewrites every `DT_NEEDED` entry with a matching local `.so` file to a short local alias such as `./libm` or `./plugin` and rewrites `PT_INTERP` to `./ld`. Shared-object names do not need a `lib` prefix.
+`patchelf` mode sets the `RPATH` to `.` whenever local shared libraries are
+present and sets the interpreter to `./ld`. Manual mode rewrites every
+`DT_NEEDED` entry with a matching local `.so` file to a short local alias such
+as `./libm` or `./plugin` and rewrites `PT_INTERP` to `./ld`. Shared-object
+names do not need a `lib` prefix.
 
-Both active modes create the necessary symlinks. Manual replacements must fit within the original ELF string slot; oversized or unresolved entries are skipped with a warning. The deprecated `--no-patchelf` and `--no-patch-bin` options remain available as compatibility aliases.
+Both modes create the necessary symlinks. Manual replacements must fit within
+the original ELF string slot; oversized or unresolved entries are skipped with a
+warning.
 
 ### Custom Templates
 
-If you prefer a different `solve.py` boilerplate, you can provide a custom template path. The names of the `exe`, `libc`, and `ld` bindings can also be customized.
+Use your own `solve.py` boilerplate with `--template-path` (`-t`), and rename
+the `exe`, `libc`, and `ld` variables if you like:
 
 ```sh
-pwninit pwn --template-path <path> \
+pwninit pwn -t ~/.config/pwninit-template.py \
         --template-bin-name exe \
         --template-libc-name libc \
         --template-ld-name ld
 ```
 
-Binding names must be valid, distinct Python identifiers and cannot be Python keywords.
+Variable names must be valid, distinct Python identifiers and cannot be Python
+keywords. See [`src/template.py`](src/template.py) for the template format and
+available placeholders.
 
-By default, the solve script is written to `solve.py`. Existing files are preserved and reported as skipped:
+The solve script goes to `solve.py` by default. Existing files are kept and
+reported as skipped unless `--force` (`-f`) is given:
 
 ```sh
-pwninit pwn --solve-path scripts/solve.py
-pwninit pwn --solve-path scripts/solve.py --force
+pwninit pwn -s scripts/solve.py
+pwninit pwn -s scripts/solve.py -f
 ```
 
-For the exact template format and available variables, refer to [`src/template.py`](src/template.py).
-
-#### Persisting Custom Templates
-
-To automatically load your custom template on every run, you can add an alias to your shell configuration file (e.g., `~/.bashrc` or `~/.zshrc`).
+To use your template on every run, add a shell alias:
 
 ```bash
-alias pwninit-pwn='pwninit pwn --template-path ~/.config/pwninit-template.py --template-bin-name e'
+alias pwninit-pwn='pwninit pwn -t ~/.config/pwninit-template.py --template-bin-name e'
 ```
 
 ### Output and Automation
 
-Every workflow prints a final completed, skipped, and failed step summary. Required step failures return a nonzero exit status. `--best-effort` continues independent steps after a failure but still returns a failure status when a required step did not complete.
+Every run ends with a summary of completed, skipped, and failed steps. A failed
+required step gives a nonzero exit status. `--best-effort` keeps going with
+independent steps after a failure, but still exits nonzero.
 
-```sh
-pwninit pwn --best-effort
-```
+| Flag | Effect |
+|---|---|
+| `-n, --dry-run` | print the plan and change nothing |
+| `-q, --quiet` | print only step counts |
+| `-v, --verbose` | print extra diagnostics |
+| `--json` | print one machine-readable JSON result on stdout (includes `"dry_run"`) |
 
-Use `--quiet` for a count-only summary, `--verbose` for additional diagnostics, or `--json` for one machine-readable result on stdout:
+Global flags work before or after the command (`pwninit -n pwn` or
+`pwninit pwn -n`). With `--json`, `pwninit libc launchpad`/`debian` need
+`--non-interactive` or `--exact-version`, since they cannot prompt.
 
-```sh
-pwninit pwn --quiet
-pwninit pwn --verbose
-pwninit pwn --json
-```
+## Migrating from v4
 
-JSON package fetching requires `--non-interactive` or `--exact-version`. The installed version is available through `pwninit --version`.
+v5 reorganizes the command line. Old flags are gone, not aliased:
+
+| v4 | v5 |
+|---|---|
+| `pwninit --bin x` (pwn flags with no command) | `pwninit pwn --bin x` |
+| bare `pwninit` always ran pwn | bare `pwninit` detects kernel vs pwn |
+| `pwninit fetch-libc 2.31` | `pwninit libc launchpad 2.31` |
+| `fetch-libc --source docker --image u:22.04` | `pwninit libc docker --image u:22.04` |
+| `fetch-libc 2.36 --source debian --release b` | `pwninit libc debian 2.36 --release b` |
+| `fetch-libc -b ./bin` / `-i img` / `-r rel` | `--from-bin` / `--image` / `--release` (long only) |
+| `fetch-libc --output f` / `-O f` | `--libc-output f` |
+| `--no-unstrip` | `--skip unstrip` |
+| `--no-template` | `--skip template` |
+| `--patch-mode none`, `--no-patch-bin` | `--skip patch` |
+| `--no-patchelf` | `--patch-mode manual` |
+| `--no-vmlinux`, `--no-export-modules` | `--skip vmlinux`, `--skip modules` |

@@ -17,6 +17,8 @@ pub enum StepStatus {
     Completed,
     Skipped,
     Failed,
+    /// Would run, but `--dry-run` stopped it.
+    Planned,
 }
 
 impl StepStatus {
@@ -25,6 +27,7 @@ impl StepStatus {
             Self::Completed => "completed",
             Self::Skipped => "skipped",
             Self::Failed => "failed",
+            Self::Planned => "planned",
         }
     }
 }
@@ -56,6 +59,15 @@ impl Step {
         }
     }
 
+    pub fn planned(name: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            status: StepStatus::Planned,
+            detail: detail.into(),
+            required: false,
+        }
+    }
+
     pub fn failed(name: impl Into<String>, detail: impl Into<String>, required: bool) -> Self {
         Self {
             name: name.into(),
@@ -69,6 +81,7 @@ impl Step {
 #[derive(Debug, Clone)]
 pub struct Summary {
     pub command: &'static str,
+    pub dry_run: bool,
     pub steps: Vec<Step>,
 }
 
@@ -76,6 +89,7 @@ impl Summary {
     pub fn new(command: &'static str) -> Self {
         Self {
             command,
+            dry_run: false,
             steps: Vec::new(),
         }
     }
@@ -209,6 +223,7 @@ pub fn render_summary(summary: &Summary) {
             "{}",
             json!({
                 "command": summary.command,
+                "dry_run": summary.dry_run,
                 "success": summary.success(),
                 "steps": steps,
                 "warnings": warnings,
@@ -217,17 +232,35 @@ pub fn render_summary(summary: &Summary) {
         return;
     }
 
+    let dry_run = summary.dry_run;
+
     if !QUIET.load(Ordering::Relaxed) {
         println!();
-        println!("{}", "summary".bold());
+        if dry_run {
+            println!("{}", "plan (dry run, nothing was changed)".bold());
+        } else {
+            println!("{}", "summary".bold());
+        }
         for step in &summary.steps {
             let marker = match step.status {
                 StepStatus::Completed => "✓".green(),
                 StepStatus::Skipped => "-".yellow(),
                 StepStatus::Failed => "✗".red(),
+                StepStatus::Planned => "→".cyan(),
             };
             println!("{} {}: {}", marker, step.name, step.detail);
         }
+        if dry_run {
+            println!();
+            println!("Run again without --dry-run to apply.");
+        }
+    } else if dry_run {
+        let planned = summary
+            .steps
+            .iter()
+            .filter(|step| matches!(step.status, StepStatus::Planned))
+            .count();
+        println!("planned: {planned} (dry run)");
     } else {
         let completed = summary
             .steps

@@ -588,7 +588,7 @@ pub fn generate_debug_launcher(opts: &KernelOpts) -> Result<WriteOutcome> {
     write_generated(&opts.debug_run_path, script.as_bytes(), opts.force, true)
 }
 
-fn relative_flag_paths(opts: &KernelOpts) -> Result<Vec<PathBuf>> {
+pub(crate) fn relative_flag_paths(opts: &KernelOpts) -> Result<Vec<PathBuf>> {
     let Some(run_script) = &opts.run_script else {
         return Ok(Vec::new());
     };
