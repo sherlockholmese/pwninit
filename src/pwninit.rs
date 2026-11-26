@@ -1,3 +1,4 @@
+use crate::artifact;
 use crate::fetch_libc;
 use crate::kernel;
 use crate::kernel_image;
@@ -42,13 +43,13 @@ pub enum Error {
     #[snafu(display("failed downloading libc: {}", source))]
     FetchLibc { source: fetch_libc::Error },
 
-    #[snafu(display("one or more required setup steps failed"))]
-    Incomplete,
+    #[snafu(display("required setup failed: {}", details))]
+    Incomplete { details: String },
 }
 
 pub type Result<T = ()> = std::result::Result<T, Error>;
 
-fn run_libc(libc: opts::LibcCommand, summary: &mut Summary) -> Result {
+fn run_libc(libc: opts::LibcCommand, summary: &mut Summary) {
     let output = match &libc.source {
         LibcSource::Launchpad(opts) => &opts.output,
         LibcSource::Docker(opts) => &opts.output,
@@ -66,7 +67,7 @@ fn run_libc(libc: opts::LibcCommand, summary: &mut Summary) -> Result {
                     err.to_string(),
                     true,
                 ));
-                return Ok(());
+                return;
             }
         }
     }
@@ -78,7 +79,7 @@ fn run_libc(libc: opts::LibcCommand, summary: &mut Summary) -> Result {
             err.to_string(),
             true,
         ));
-        return Ok(());
+        return;
     }
     let libc_output = if output.libc_output.is_absolute() {
         output.libc_output.clone()
@@ -88,7 +89,7 @@ fn run_libc(libc: opts::LibcCommand, summary: &mut Summary) -> Result {
     if let Some(parent) = libc_output.parent() {
         if let Err(err) = fs::create_dir_all(parent) {
             summary.push(Step::failed("prepare libc output", err.to_string(), true));
-            return Ok(());
+            return;
         }
     }
 
@@ -103,13 +104,12 @@ fn run_libc(libc: opts::LibcCommand, summary: &mut Summary) -> Result {
             opts.select.exact_version.as_deref(),
         )
         .context(FetchLibcSnafu),
-        LibcSource::Docker(opts) => {
-            let image = fetch_libc::docker_image_name(
-                opts.image.as_deref(),
-                opts.distro.as_deref(),
-                opts.release.as_deref(),
-            )
-            .context(FetchLibcSnafu)?;
+        LibcSource::Docker(opts) => fetch_libc::docker_image_name(
+            opts.image.as_deref(),
+            opts.distro.as_deref(),
+            opts.release.as_deref(),
+        )
+        .and_then(|image| {
             fetch_libc::fetch_libc_from_docker_to(
                 &image,
                 arch,
@@ -117,8 +117,8 @@ fn run_libc(libc: opts::LibcCommand, summary: &mut Summary) -> Result {
                 output_dir,
                 &extra_libs,
             )
-            .context(FetchLibcSnafu)
-        }
+        })
+        .context(FetchLibcSnafu),
         LibcSource::Debian(opts) => fetch_libc::fetch_libc_from_debian_selected(
             &opts.version,
             arch,
@@ -139,8 +139,6 @@ fn run_libc(libc: opts::LibcCommand, summary: &mut Summary) -> Result {
         )),
         Err(err) => summary.push(Step::failed("fetch libc", err.to_string(), true)),
     }
-
-    Ok(())
 }
 
 fn push_required<T, E: std::fmt::Display>(
@@ -243,8 +241,8 @@ fn run_pwn_flow(mut pwn_opts: crate::opts::PwnOpts, summary: &mut Summary) {
         return;
     }
 
-    let libc_failures = maybe_visit_libc_report(&pwn_opts);
-    if libc_failures.is_empty() {
+    let libc_steps = maybe_visit_libc_report(&pwn_opts);
+    if libc_steps.is_empty() {
         if pwn_opts.libc.is_some() {
             summary.push(Step::completed(
                 "prepare libc",
@@ -254,10 +252,16 @@ fn run_pwn_flow(mut pwn_opts: crate::opts::PwnOpts, summary: &mut Summary) {
             summary.push(Step::skipped("prepare libc", "no libc was provided"));
         }
     } else {
-        for failure in libc_failures {
-            summary.push(Step::failed("prepare libc", failure, true));
+        let failed = libc_steps
+            .iter()
+            .any(|step| step.required && matches!(step.status, output::StepStatus::Failed));
+        for step in libc_steps {
+            if !step.required && matches!(step.status, output::StepStatus::Failed) {
+                output::warning(format!("{}: {}", step.name, step.detail));
+            }
+            summary.push(step);
         }
-        if !pwn_opts.best_effort {
+        if failed && !pwn_opts.best_effort {
             return;
         }
     }
@@ -490,7 +494,13 @@ fn run_kernel_flow(kernel_opts: crate::opts::KernelOpts, summary: &mut Summary) 
         ));
     }
 
-    let debug_initramfs_ready = if let Some(path) = kernel_opts.debug_initramfs.as_deref() {
+    let debug_initramfs_ready = if archive_compression.is_none() {
+        summary.push(Step::skipped(
+            "prepare debug initramfs",
+            "initramfs inspection failed",
+        ));
+        false
+    } else if let Some(path) = kernel_opts.debug_initramfs.as_deref() {
         let ready = record_kernel_write(
             summary,
             "prepare debug initramfs",
@@ -650,18 +660,21 @@ fn run_kernel_flow(kernel_opts: crate::opts::KernelOpts, summary: &mut Summary) 
 
 /// A "write this file" step for a dry run, honouring `--force`.
 fn plan_write(name: &str, path: &std::path::Path, force: bool) -> Step {
-    if path.exists() && !force {
-        Step::skipped(
+    match artifact::existing(path) {
+        Ok(Some(_)) if !force => Step::skipped(
             name,
             format!(
                 "{} already exists; use --force to overwrite",
                 path.display()
             ),
-        )
-    } else if path.exists() {
-        Step::planned(name, format!("overwrite {}", path.display()))
-    } else {
-        Step::planned(name, format!("write {}", path.display()))
+        ),
+        Ok(Some(_)) => Step::planned(name, format!("overwrite {}", path.display())),
+        Ok(None) => Step::planned(name, format!("write {}", path.display())),
+        Err(err) => Step::failed(
+            name,
+            format!("failed inspecting {}: {err}", path.display()),
+            true,
+        ),
     }
 }
 
@@ -884,7 +897,12 @@ pub fn run_with_summary(opts: Opts) -> Result<Summary> {
     output::verbose(format!("resolved command: {}", opts.command_name()));
 
     let Some(cmd) = opts.cmd else {
-        unreachable!("with_resolved_command always sets a command");
+        summary.push(Step::failed(
+            "resolve command",
+            "command could not be determined",
+            true,
+        ));
+        return Ok(summary);
     };
 
     if dry_run {
@@ -898,7 +916,7 @@ pub fn run_with_summary(opts: Opts) -> Result<Summary> {
     }
 
     match cmd {
-        Command::Libc(libc) => run_libc(libc, &mut summary)?,
+        Command::Libc(libc) => run_libc(libc, &mut summary),
         Command::Rev(rev_opts) => run_rev_flow(rev_opts, &mut summary),
         Command::Kernel(kernel_opts) => run_kernel_flow(kernel_opts, &mut summary),
         Command::Pwn(pwn_opts) => run_pwn_flow(pwn_opts, &mut summary),
@@ -912,7 +930,14 @@ pub fn run(opts: Opts) -> Result {
     if summary.success() {
         Ok(())
     } else {
-        Err(Error::Incomplete)
+        let details = summary
+            .steps
+            .iter()
+            .filter(|step| step.required && matches!(step.status, output::StepStatus::Failed))
+            .map(|step| format!("{}: {}", step.name, step.detail))
+            .collect::<Vec<_>>()
+            .join("; ");
+        Err(Error::Incomplete { details })
     }
 }
 

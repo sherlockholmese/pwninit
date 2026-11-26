@@ -1,16 +1,15 @@
+use crate::artifact;
 use crate::cpu_arch::CpuArch;
 use crate::fetch_ld;
 use crate::output;
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::io::Read;
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
 use colored::Colorize;
-use ex::fs;
-use ex::io;
 use snafu::OptionExt;
 use snafu::ResultExt;
 use snafu::Snafu;
@@ -23,14 +22,24 @@ pub enum Error {
         source: std::io::Error,
     },
 
-    #[snafu(display("docker {} failed with nonzero exit status: {}", action, status))]
-    DockerStatus { action: String, status: ExitStatus },
+    #[snafu(display("docker {} failed ({}): {}", action, status, stderr.trim()))]
+    DockerStatus {
+        action: String,
+        status: ExitStatus,
+        stderr: String,
+    },
 
     #[snafu(display("docker {} did not produce stdout", action))]
     DockerStdout { action: String },
 
+    #[snafu(display("failed capturing Docker export diagnostics: {}", source))]
+    DockerDiagnostics { source: io::Error },
+
     #[snafu(display("docker create returned an empty container id"))]
     EmptyContainerId,
+
+    #[snafu(display("docker create returned an invalid container id"))]
+    InvalidContainerId,
 
     #[snafu(display("failed reading exported image filesystem tar: {}", source))]
     Tar { source: std::io::Error },
@@ -85,11 +94,12 @@ struct ContainerGuard {
 
 impl Drop for ContainerGuard {
     fn drop(&mut self) {
-        let _ = Command::new("docker")
-            .args(["rm", "-f", &self.id])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        if let Err(err) = run_docker_stdout("rm", &["rm", "-f", &self.id]) {
+            output::warning(format!(
+                "failed cleaning up Docker container {}: {err}",
+                self.id
+            ));
+        }
     }
 }
 
@@ -108,14 +118,15 @@ fn musl_arch_name(arch: CpuArch) -> &'static str {
 }
 
 fn run_docker_status(action: &str, args: &[&str]) -> Result {
-    let mut command = Command::new("docker");
-    command.args(args);
     if output::is_json() {
-        command.stdout(Stdio::null()).stderr(Stdio::null());
+        return run_docker_stdout(action, args).map(|_| ());
     }
-    let status = command.status().context(DockerExecSnafu {
-        action: action.to_string(),
-    })?;
+    let status = Command::new("docker")
+        .args(args)
+        .status()
+        .context(DockerExecSnafu {
+            action: action.to_string(),
+        })?;
 
     if status.success() {
         Ok(())
@@ -123,6 +134,7 @@ fn run_docker_status(action: &str, args: &[&str]) -> Result {
         Err(Error::DockerStatus {
             action: action.to_string(),
             status,
+            stderr: String::new(),
         })
     }
 }
@@ -141,43 +153,69 @@ fn run_docker_stdout(action: &str, args: &[&str]) -> Result<Vec<u8>> {
         Err(Error::DockerStatus {
             action: action.to_string(),
             status: out.status,
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         })
     }
 }
 
 fn create_container(image: &str, platform: &str) -> Result<ContainerGuard> {
-    let out = run_docker_stdout("create", &["create", "--platform", platform, image])?;
+    let out = run_docker_stdout("create", &["create", "--platform", platform, "--", image])?;
     let id = String::from_utf8_lossy(&out).trim().to_string();
     if id.is_empty() {
         return Err(Error::EmptyContainerId);
+    }
+    if !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(Error::InvalidContainerId);
     }
     Ok(ContainerGuard { id })
 }
 
 fn export_container(container: &ContainerGuard, plan: &ExtractionPlan) -> Result {
-    let mut child = Command::new("docker")
+    let mut command = Command::new("docker");
+    command
         .args(["export", &container.id])
-        .stdout(Stdio::piped())
-        .spawn()
-        .context(DockerExecSnafu {
-            action: "export".to_string(),
-        })?;
-
-    let stdout = child.stdout.take().context(DockerStdoutSnafu {
+        .stdout(Stdio::piped());
+    let mut diagnostics = if output::is_json() {
+        let file = tempfile::tempfile().context(DockerDiagnosticsSnafu)?;
+        command.stderr(Stdio::from(
+            file.try_clone().context(DockerDiagnosticsSnafu)?,
+        ));
+        Some(file)
+    } else {
+        None
+    };
+    let mut child = command.spawn().context(DockerExecSnafu {
         action: "export".to_string(),
     })?;
-    let extract_result = extract_from_tar(stdout, plan);
+
+    let mut stdout = child.stdout.take().context(DockerStdoutSnafu {
+        action: "export".to_string(),
+    })?;
+    let extract_result = stage_from_tar(&mut stdout, plan).and_then(|files| {
+        io::copy(&mut stdout, &mut io::sink()).context(TarSnafu)?;
+        Ok(files)
+    });
+    drop(stdout);
     let status = child.wait().context(DockerExecSnafu {
         action: "export".to_string(),
     })?;
     if !status.success() {
+        let mut stderr = Vec::new();
+        if let Some(file) = diagnostics.as_mut() {
+            file.seek(SeekFrom::Start(0))
+                .context(DockerDiagnosticsSnafu)?;
+            file.take(64 * 1024)
+                .read_to_end(&mut stderr)
+                .context(DockerDiagnosticsSnafu)?;
+        }
         return Err(Error::DockerStatus {
             action: "export".to_string(),
             status,
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
         });
     }
 
-    extract_result
+    publish_libraries(extract_result?)
 }
 
 fn runtime_library_path(path: &Path) -> bool {
@@ -258,7 +296,10 @@ fn output_paths(output: &[ExtractOutput], matched_file_name: &str) -> Vec<PathBu
     paths
 }
 
-fn extract_from_tar(reader: impl Read, plan: &ExtractionPlan) -> Result {
+fn stage_from_tar(
+    reader: impl Read,
+    plan: &ExtractionPlan,
+) -> Result<Vec<(PathBuf, tempfile::NamedTempFile)>> {
     let mut candidates: HashMap<String, Vec<Candidate>> = HashMap::new();
     let mut runtime_file_names = Vec::new();
     let mut archive = tar::Archive::new(reader);
@@ -295,9 +336,16 @@ fn extract_from_tar(reader: impl Read, plan: &ExtractionPlan) -> Result {
         }
 
         let mut bytes = Vec::new();
-        entry
+        let expected = entry.size();
+        let read = entry
             .read_to_end(&mut bytes)
             .context(ReadEntrySnafu { path: path.clone() })?;
+        if read as u64 != expected {
+            return Err(Error::ReadEntry {
+                path,
+                source: io::Error::new(io::ErrorKind::UnexpectedEof, "truncated tar entry"),
+            });
+        }
 
         for (soname, score) in matches {
             candidates.entry(soname).or_default().push(Candidate {
@@ -309,6 +357,7 @@ fn extract_from_tar(reader: impl Read, plan: &ExtractionPlan) -> Result {
     }
 
     let family = detect_family(runtime_file_names);
+    let mut files = Vec::new();
     for target in plan.targets_for(family) {
         let Some(found) = candidates.get_mut(&target.label) else {
             return Err(Error::FileNotFound {
@@ -332,10 +381,23 @@ fn extract_from_tar(reader: impl Read, plan: &ExtractionPlan) -> Result {
                 .yellow()
                 .bold(),
             );
-            fs::write(&out_path, &found[0].bytes).context(WriteSnafu { path: out_path })?;
+            let temporary =
+                artifact::stage_replacement(&out_path, |file| file.write_all(&found[0].bytes))
+                    .context(WriteSnafu { path: &out_path })?;
+            files.push((out_path, temporary));
         }
     }
 
+    Ok(files)
+}
+
+fn publish_libraries(files: Vec<(PathBuf, tempfile::NamedTempFile)>) -> Result {
+    for (path, temporary) in files {
+        temporary
+            .persist(&path)
+            .map_err(|err| err.error)
+            .context(WriteSnafu { path })?;
+    }
     Ok(())
 }
 
@@ -409,7 +471,7 @@ pub fn extract_libc_files(
             .cyan()
             .bold(),
     );
-    run_docker_status("pull", &["pull", "--platform", platform, image])?;
+    run_docker_status("pull", &["pull", "--platform", platform, "--", image])?;
     let container = create_container(image, platform)?;
     export_container(&container, &plan)
 }
@@ -455,7 +517,8 @@ mod tests {
         ]);
 
         let decoder = flate2::read::GzDecoder::new(Cursor::new(tar));
-        extract_from_tar(decoder, &plan).expect("extract filesystem");
+        publish_libraries(stage_from_tar(decoder, &plan).expect("extract filesystem"))
+            .expect("publish filesystem");
 
         assert_eq!(std::fs::read(libc_out).expect("read libc"), b"libc bytes");
         assert_eq!(
@@ -476,7 +539,8 @@ mod tests {
         let tar = tiny_fs_tar(&[("lib/ld-musl-x86_64.so.1", b"musl bytes")]);
 
         let decoder = flate2::read::GzDecoder::new(Cursor::new(tar));
-        extract_from_tar(decoder, &plan).expect("extract musl filesystem");
+        publish_libraries(stage_from_tar(decoder, &plan).expect("extract musl filesystem"))
+            .expect("publish musl filesystem");
 
         assert_eq!(std::fs::read(libc_out).expect("read libc"), b"musl bytes");
         assert_eq!(
@@ -500,11 +564,28 @@ mod tests {
         );
         let tar = tiny_fs_tar(&[("usr/lib/x86_64-linux-gnu/libm.so.6", b"libm")]);
         let decoder = flate2::read::GzDecoder::new(Cursor::new(tar));
-        let err = extract_from_tar(decoder, &plan).expect_err("missing libc should fail");
+        let err = stage_from_tar(decoder, &plan).expect_err("missing libc should fail");
 
         match err {
             Error::FileNotFound { soname } => assert_eq!(soname, "libc.so.6"),
             other => panic!("expected FileNotFound, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn missing_companion_preserves_existing_libc() {
+        let dir = TempDir::new().unwrap();
+        let libc_out = dir.path().join("libc.so.6");
+        std::fs::write(&libc_out, b"existing").unwrap();
+        let plan = extraction_plan(CpuArch::Amd64, &libc_out, dir.path(), &["libm.so.6"]);
+        let tar = tiny_fs_tar(&[
+            ("lib/x86_64-linux-gnu/libc.so.6", b"new libc"),
+            ("lib/x86_64-linux-gnu/ld-linux-x86-64.so.2", b"new linker"),
+        ]);
+        let decoder = flate2::read::GzDecoder::new(Cursor::new(tar));
+        let err = stage_from_tar(decoder, &plan).expect_err("missing libm should fail");
+        assert!(matches!(err, Error::FileNotFound { .. }));
+        assert_eq!(std::fs::read(libc_out).unwrap(), b"existing");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }

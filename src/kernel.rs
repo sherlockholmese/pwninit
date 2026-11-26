@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use snafu::Snafu;
 
+use crate::artifact;
 use crate::kernel_image;
 use crate::kernel_initramfs::{self, Compression};
 use crate::opts::KernelOpts;
@@ -70,6 +71,17 @@ pub enum Error {
         source: std::io::Error,
     },
 
+    #[snafu(display(
+        "failed replacing {}: {}; restoring the original failed: {}; original files are at {}",
+        path.display(), source, rollback, backup.display()
+    ))]
+    Restore {
+        path: PathBuf,
+        backup: PathBuf,
+        source: std::io::Error,
+        rollback: std::io::Error,
+    },
+
     #[snafu(display("failed parsing QEMU launcher {}: {}", path.display(), message))]
     LauncherParse { path: PathBuf, message: String },
 
@@ -84,6 +96,9 @@ pub enum Error {
         path.display()
     ))]
     InvalidRootfs { path: PathBuf },
+
+    #[snafu(display("rootfs output {} must be a directory", path.display()))]
+    RootfsNotDirectory { path: PathBuf },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -170,11 +185,16 @@ fn write_generated(
     force: bool,
     executable: bool,
 ) -> Result<WriteOutcome> {
-    if path.exists() && !force {
+    let existed = artifact::existing(path)
+        .map_err(|source| Error::Write {
+            path: path.to_path_buf(),
+            source,
+        })?
+        .is_some();
+    if existed && !force {
         return Ok(WriteOutcome::SkippedExisting);
     }
     ensure_parent(path)?;
-    let existed = path.exists();
     let mut temporary = temp_file_for(path)?;
     temporary.write_all(bytes).map_err(|source| Error::Write {
         path: path.to_path_buf(),
@@ -184,31 +204,52 @@ fn write_generated(
         path: path.to_path_buf(),
         source,
     })?;
-    let outcome = persist_generated(temporary, path, force, existed)?;
-    if executable && outcome != WriteOutcome::SkippedExisting {
-        let metadata = std::fs::metadata(path).map_err(|source| Error::Write {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        let mode = metadata.permissions().mode() | 0o111;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).map_err(
-            |source| Error::Write {
+    if executable {
+        let metadata = temporary
+            .as_file()
+            .metadata()
+            .map_err(|source| Error::Write {
                 path: path.to_path_buf(),
                 source,
-            },
-        )?;
+            })?;
+        let mode = metadata.permissions().mode() | 0o111;
+        temporary
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(mode))
+            .map_err(|source| Error::Write {
+                path: path.to_path_buf(),
+                source,
+            })?;
     }
-    Ok(outcome)
+    persist_generated(temporary, path, force, existed)
 }
 
-fn replace_directory(temporary: &Path, output: &Path) -> Result<bool> {
+fn replace_directory(temporary: &Path, output: &Path, force: bool) -> Result<bool> {
     ensure_parent(output)?;
-    if !output.exists() {
+    let current = artifact::existing(output).map_err(|source| Error::Replace {
+        path: output.to_path_buf(),
+        source,
+    })?;
+    let Some(current) = current else {
         std::fs::rename(temporary, output).map_err(|source| Error::Replace {
             path: output.to_path_buf(),
             source,
         })?;
         return Ok(false);
+    };
+    if !current.is_dir() {
+        return Err(Error::RootfsNotDirectory {
+            path: output.to_path_buf(),
+        });
+    }
+    if !force {
+        return Err(Error::Replace {
+            path: output.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "output appeared during extraction",
+            ),
+        });
     }
 
     let parent = output
@@ -228,11 +269,25 @@ fn replace_directory(temporary: &Path, output: &Path) -> Result<bool> {
         source,
     })?;
     if let Err(source) = std::fs::rename(temporary, output) {
-        let _ = std::fs::rename(&previous, output);
+        if let Err(rollback) = std::fs::rename(&previous, output) {
+            let backup = backup.keep().join("previous");
+            return Err(Error::Restore {
+                path: output.to_path_buf(),
+                backup,
+                source,
+                rollback,
+            });
+        }
         return Err(Error::Replace {
             path: output.to_path_buf(),
             source,
         });
+    }
+    if let Err(err) = backup.close() {
+        output::warning(format!(
+            "failed removing previous rootfs at {}: {err}",
+            previous.display()
+        ));
     }
     Ok(true)
 }
@@ -240,16 +295,22 @@ fn replace_directory(temporary: &Path, output: &Path) -> Result<bool> {
 pub fn extract_rootfs(opts: &KernelOpts) -> Result<ExtractOutcome> {
     let initramfs = opts.initramfs.as_deref().ok_or(Error::MissingInitramfs)?;
     reject_symlink_components(&opts.rootfs_dir)?;
-    if opts.rootfs_dir.exists() && !opts.force {
-        let metadata =
-            std::fs::symlink_metadata(&opts.rootfs_dir).map_err(|source| Error::Read {
-                path: opts.rootfs_dir.clone(),
-                source,
-            })?;
-        if !metadata.is_dir()
-            || !["init", "linuxrc", "sbin/init"]
-                .into_iter()
-                .any(|path| opts.rootfs_dir.join(path).exists())
+    let existing_rootfs = artifact::existing(&opts.rootfs_dir).map_err(|source| Error::Read {
+        path: opts.rootfs_dir.clone(),
+        source,
+    })?;
+    if existing_rootfs
+        .as_ref()
+        .is_some_and(|metadata| !metadata.is_dir())
+    {
+        return Err(Error::RootfsNotDirectory {
+            path: opts.rootfs_dir.clone(),
+        });
+    }
+    if existing_rootfs.is_some() && !opts.force {
+        if !["init", "linuxrc", "sbin/init"]
+            .into_iter()
+            .any(|path| opts.rootfs_dir.join(path).exists())
         {
             return Err(Error::InvalidRootfs {
                 path: opts.rootfs_dir.clone(),
@@ -279,7 +340,7 @@ pub fn extract_rootfs(opts: &KernelOpts) -> Result<ExtractOutcome> {
     let extracted = temporary.path().join("rootfs");
     let compression = kernel_initramfs::extract(initramfs, &extracted)
         .map_err(|source| Error::InitramfsExtract { source })?;
-    let replaced = replace_directory(&extracted, &opts.rootfs_dir)?;
+    let replaced = replace_directory(&extracted, &opts.rootfs_dir, opts.force)?;
     Ok(if replaced {
         ExtractOutcome::Replaced(compression)
     } else {
@@ -382,19 +443,29 @@ pub fn export_modules(opts: &KernelOpts) -> Result<(usize, usize)> {
     })?;
     let mut copied = 0;
     let mut skipped = 0;
-    for module in modules {
-        let destination = opts
-            .modules_dir
-            .join(module.file_name().expect("collected module has a name"));
-        if destination.exists() && !opts.force {
+    let mut modules: Vec<_> = names.into_iter().collect();
+    modules.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, module) in modules {
+        let destination = opts.modules_dir.join(name);
+        let existed = artifact::existing(&destination)
+            .map_err(|source| Error::Write {
+                path: destination.clone(),
+                source,
+            })?
+            .is_some();
+        if existed && !opts.force {
             skipped += 1;
             continue;
         }
-        std::fs::copy(&module, &destination).map_err(|source| Error::Write {
-            path: destination,
+        let temporary = temp_file_for(&destination)?;
+        std::fs::copy(&module, temporary.path()).map_err(|source| Error::Write {
+            path: destination.clone(),
             source,
         })?;
-        copied += 1;
+        match persist_generated(temporary, &destination, opts.force, existed)? {
+            WriteOutcome::SkippedExisting => skipped += 1,
+            WriteOutcome::Written | WriteOutcome::Overwritten => copied += 1,
+        }
     }
     Ok((copied, skipped))
 }
@@ -623,9 +694,8 @@ pub fn create_placeholder_flags(opts: &KernelOpts) -> Result<(usize, usize)> {
     let mut skipped = 0;
     for path in relative_flag_paths(opts)? {
         match write_generated(&path, b"flag{local_kernel_pwn_test_flag}\n", false, false)? {
-            WriteOutcome::Written => written += 1,
+            WriteOutcome::Written | WriteOutcome::Overwritten => written += 1,
             WriteOutcome::SkippedExisting => skipped += 1,
-            WriteOutcome::Overwritten => unreachable!("placeholder flags are never overwritten"),
         }
     }
     Ok((written, skipped))

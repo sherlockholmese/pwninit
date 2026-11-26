@@ -36,6 +36,8 @@ use xz2::stream::LzmaOptions;
 use xz2::write::XzEncoder;
 
 const CPIO_MAGIC_NEWC: &[u8; 6] = b"070701";
+const MAX_ARCHIVE_BYTES: usize = 512 * 1024 * 1024;
+const MAX_XZ_MEMORY: u64 = 256 * 1024 * 1024;
 const CPIO_MAGIC_CRC: &[u8; 6] = b"070702";
 const CPIO_HEADER_LEN: usize = 110;
 const S_IFMT: u32 = 0o170000;
@@ -90,6 +92,12 @@ impl Compression {
 
 #[derive(Debug, Snafu)]
 pub enum Error {
+    #[snafu(display("initramfs input {} exceeds {} MiB", path.display(), MAX_ARCHIVE_BYTES / 1024 / 1024))]
+    InputTooLarge { path: PathBuf },
+
+    #[snafu(display("decoded {} data exceeds {} MiB", compression, MAX_ARCHIVE_BYTES / 1024 / 1024))]
+    DecodedTooLarge { compression: &'static str },
+
     #[snafu(display("failed reading {}: {}", path.display(), source))]
     Read {
         path: PathBuf,
@@ -340,14 +348,20 @@ pub fn detect_compression(bytes: &[u8]) -> Option<Compression> {
         .find_map(|(signature, compression)| bytes.starts_with(signature).then_some(*compression))
 }
 
-fn read_to_end(mut reader: impl Read, compression: Compression) -> Result<Vec<u8>> {
+fn read_to_end(reader: impl Read, compression: Compression) -> Result<Vec<u8>> {
     let mut output = Vec::new();
     reader
+        .take(MAX_ARCHIVE_BYTES as u64 + 1)
         .read_to_end(&mut output)
         .map_err(|err| Error::Decompress {
             compression: compression.name(),
             message: err.to_string(),
         })?;
+    if output.len() > MAX_ARCHIVE_BYTES {
+        return Err(Error::DecodedTooLarge {
+            compression: compression.name(),
+        });
+    }
     Ok(output)
 }
 
@@ -359,7 +373,8 @@ fn decompress_lz4_legacy(bytes: &[u8]) -> Result<Vec<u8>> {
     while offset < bytes.len() {
         let size_bytes = checked_slice(bytes, offset, 4, "legacy lz4 block size")?;
         let block_size =
-            u32::from_le_bytes(size_bytes.try_into().expect("four-byte block size")) as usize;
+            u32::from_le_bytes([size_bytes[0], size_bytes[1], size_bytes[2], size_bytes[3]])
+                as usize;
         offset += 4;
         if block_size == 0 {
             break;
@@ -378,6 +393,11 @@ fn decompress_lz4_legacy(bytes: &[u8]) -> Result<Vec<u8>> {
                 message: err.to_string(),
             }
         })?;
+        if decompressed.len() > MAX_ARCHIVE_BYTES - output.len() {
+            return Err(Error::DecodedTooLarge {
+                compression: Compression::Lz4Legacy.name(),
+            });
+        }
         output.extend_from_slice(&decompressed);
     }
     Ok(output)
@@ -401,21 +421,37 @@ fn compress_lz4_legacy(bytes: &[u8]) -> Result<Vec<u8>> {
 
 pub fn decompress(bytes: &[u8], compression: Compression) -> Result<Vec<u8>> {
     match compression {
+        Compression::None if bytes.len() > MAX_ARCHIVE_BYTES => Err(Error::DecodedTooLarge {
+            compression: compression.name(),
+        }),
         Compression::None => Ok(bytes.to_vec()),
         Compression::Gzip => read_to_end(GzDecoder::new(bytes), compression),
-        Compression::Xz => read_to_end(xz2::read::XzDecoder::new(bytes), compression),
-        Compression::Lzma => {
-            let stream = Stream::new_lzma_decoder(u64::MAX).map_err(|err| Error::Decompress {
+        Compression::Xz | Compression::Lzma => {
+            let stream = match compression {
+                Compression::Xz => Stream::new_stream_decoder(MAX_XZ_MEMORY, 0),
+                _ => Stream::new_lzma_decoder(MAX_XZ_MEMORY),
+            }
+            .map_err(|err| Error::Decompress {
                 compression: compression.name(),
                 message: err.to_string(),
             })?;
             read_to_end(xz2::read::XzDecoder::new_stream(bytes, stream), compression)
         }
         Compression::Bzip2 => read_to_end(BzDecoder::new(bytes), compression),
-        Compression::Zstd => zstd::stream::decode_all(bytes).map_err(|err| Error::Decompress {
-            compression: compression.name(),
-            message: err.to_string(),
-        }),
+        Compression::Zstd => {
+            let mut decoder =
+                zstd::stream::read::Decoder::new(bytes).map_err(|err| Error::Decompress {
+                    compression: compression.name(),
+                    message: err.to_string(),
+                })?;
+            decoder
+                .window_log_max(27)
+                .map_err(|err| Error::Decompress {
+                    compression: compression.name(),
+                    message: err.to_string(),
+                })?;
+            read_to_end(decoder, compression)
+        }
         Compression::Lz4 => read_to_end(FrameDecoder::new(bytes), compression),
         Compression::Lz4Legacy => decompress_lz4_legacy(bytes),
     }
@@ -499,10 +535,27 @@ pub fn compress(bytes: &[u8], compression: Compression) -> Result<Vec<u8>> {
 }
 
 pub fn read_archive(path: &Path) -> Result<(Compression, Vec<u8>)> {
-    let bytes = std::fs::read(path).map_err(|source| Error::Read {
+    let read_error = |source| Error::Read {
         path: path.to_path_buf(),
         source,
-    })?;
+    };
+    let metadata = crate::artifact::regular_file(path).map_err(read_error)?;
+    if metadata.len() > MAX_ARCHIVE_BYTES as u64 {
+        return Err(Error::InputTooLarge {
+            path: path.to_path_buf(),
+        });
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .map_err(read_error)?
+        .take(MAX_ARCHIVE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(read_error)?;
+    if bytes.len() > MAX_ARCHIVE_BYTES {
+        return Err(Error::InputTooLarge {
+            path: path.to_path_buf(),
+        });
+    }
     let compression = detect_compression(&bytes).ok_or(Error::UnknownFormat)?;
     let archive = decompress(&bytes, compression)?;
     if !archive.starts_with(CPIO_MAGIC_NEWC) && !archive.starts_with(CPIO_MAGIC_CRC) {
@@ -512,16 +565,18 @@ pub fn read_archive(path: &Path) -> Result<(Compression, Vec<u8>)> {
 }
 
 pub fn detect_file_compression(path: &Path) -> Result<Compression> {
-    let mut file = std::fs::File::open(path).map_err(|source| Error::Read {
+    let read_error = |source| Error::Read {
         path: path.to_path_buf(),
         source,
-    })?;
-    let mut prefix = [0u8; 8];
-    let size = file.read(&mut prefix).map_err(|source| Error::Read {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    detect_compression(&prefix[..size]).ok_or(Error::UnknownFormat)
+    };
+    crate::artifact::regular_file(path).map_err(read_error)?;
+    let mut prefix = Vec::with_capacity(8);
+    std::fs::File::open(path)
+        .map_err(read_error)?
+        .take(8)
+        .read_to_end(&mut prefix)
+        .map_err(read_error)?;
+    detect_compression(&prefix).ok_or(Error::UnknownFormat)
 }
 
 pub fn inspect(path: &Path) -> Result<Compression> {

@@ -1,12 +1,13 @@
+use crate::artifact;
 use crate::opts::{PwnOpts, RevOpts};
 use crate::output;
 use crate::patch_bin;
-use crate::set_exec;
 
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::io::Write;
-use std::path::Path;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::string;
 
 use colored::Colorize;
@@ -22,20 +23,17 @@ pub enum Error {
     #[snafu(display("solve script template is not valid UTF-8: {}", source))]
     Utf8 { source: string::FromUtf8Error },
 
-    #[snafu(display("error writing solve script template: {}", source))]
-    Write { source: io::Error },
-
-    #[snafu(display("error writing solve script template: {}", source))]
-    WriteStd { source: std::io::Error },
+    #[snafu(display("failed writing solve script {}: {}", path.display(), source))]
+    Write {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 
     #[snafu(display("error reading solve script template: {}", source))]
     Read { source: io::Error },
 
     #[snafu(display("error filling in solve script template: {}", source))]
     Fmt { source: strfmt::FmtError },
-
-    #[snafu(display("error setting solve script template executable: {}", source))]
-    SetExec { source: io::Error },
 
     #[snafu(display("error creating solve script directory: {}", source))]
     CreateDir { source: io::Error },
@@ -73,47 +71,61 @@ pub enum WriteStubOutcome {
 }
 
 fn write_stub_file(path: &Path, stub: String, force: bool) -> Result<WriteStubOutcome> {
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent).context(CreateDirSnafu)?;
+    let metadata = artifact::existing(path).context(WriteSnafu { path })?;
+    if metadata.is_some() && !force {
+        return Ok(WriteStubOutcome::SkippedExisting);
     }
+    fs::create_dir_all(artifact::parent(path)).context(CreateDirSnafu)?;
+
+    let mut temporary = artifact::stage(path).context(WriteSnafu { path })?;
+    temporary
+        .write_all(stub.as_bytes())
+        .context(WriteSnafu { path })?;
+    temporary.flush().context(WriteSnafu { path })?;
+    let permissions = match metadata.as_ref().filter(|metadata| metadata.is_file()) {
+        Some(metadata) => metadata.permissions(),
+        None => temporary
+            .as_file()
+            .metadata()
+            .context(WriteSnafu { path })?
+            .permissions(),
+    };
+    temporary
+        .as_file()
+        .set_permissions(std::fs::Permissions::from_mode(
+            (permissions.mode() & 0o777) | umask::EXEC,
+        ))
+        .context(WriteSnafu { path })?;
 
     let outcome = if force {
-        let outcome = if path.exists() {
+        temporary
+            .persist(path)
+            .map_err(|err| err.error)
+            .context(WriteSnafu { path })?;
+        if metadata.is_some() {
             WriteStubOutcome::Overwritten
         } else {
             WriteStubOutcome::Written
-        };
-        fs::write(path, stub).context(WriteSnafu)?;
-        outcome
+        }
     } else {
-        let mut file = match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-        {
-            Ok(file) => file,
-            Err(source) if source.kind() == ErrorKind::AlreadyExists => {
-                output::progress(
-                    format!("leaving existing solve script {}", path.display())
-                        .cyan()
-                        .bold(),
-                );
+        match temporary.persist_noclobber(path) {
+            Ok(_) => WriteStubOutcome::Written,
+            Err(err) if err.error.kind() == ErrorKind::AlreadyExists => {
                 return Ok(WriteStubOutcome::SkippedExisting);
             }
-            Err(source) => return Err(Error::WriteStd { source }),
-        };
-        file.write_all(stub.as_bytes()).context(WriteStdSnafu)?;
-        WriteStubOutcome::Written
+            Err(err) => {
+                return Err(Error::Write {
+                    path: path.to_path_buf(),
+                    source: err.error,
+                })
+            }
+        }
     };
     output::progress(
         format!("writing solve script {}", path.display())
             .cyan()
             .bold(),
     );
-    set_exec(path).context(SetExecSnafu)?;
     Ok(outcome)
 }
 
@@ -236,7 +248,13 @@ fn make_stub<T: StubOptions>(opts: &T) -> Result<String> {
 }
 
 pub fn write_stub<T: StubOptions>(opts: &T) -> Result<WriteStubOutcome> {
-    if opts.solve_path().exists() && !opts.force() {
+    if !opts.force()
+        && artifact::existing(opts.solve_path())
+            .context(WriteSnafu {
+                path: opts.solve_path(),
+            })?
+            .is_some()
+    {
         output::progress(
             format!(
                 "leaving existing solve script {}",

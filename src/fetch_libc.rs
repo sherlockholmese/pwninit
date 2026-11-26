@@ -36,6 +36,9 @@ pub enum Error {
     #[snafu(display("failed to read user input: {}", source))]
     Stdin { source: io::Error },
 
+    #[snafu(display("failed writing version selection output: {}", source))]
+    SelectionOutput { source: io::Error },
+
     #[snafu(display("version selection ended before a choice was made"))]
     SelectionEof,
 
@@ -63,6 +66,9 @@ pub enum Error {
 
     #[snafu(display("invalid extra libc library name: {}", name))]
     InvalidExtraLibName { name: String },
+
+    #[snafu(display("libc output {} conflicts with a runtime library output", path.display()))]
+    OutputCollision { path: std::path::PathBuf },
 
     #[snafu(display("fetch-libc launchpad source requires a glibc version argument"))]
     MissingLaunchpadVersion,
@@ -198,7 +204,7 @@ fn normalize_extra_lib_name(lib_name: &str) -> &str {
 }
 
 fn validate_extra_lib_name(lib_name: &str) -> Result {
-    if lib_name.is_empty() || lib_name.contains('/') || lib_name.contains('\0') {
+    if matches!(lib_name, "" | "." | "..") || lib_name.contains('/') || lib_name.contains('\0') {
         return Err(Error::InvalidExtraLibName {
             name: lib_name.to_string(),
         });
@@ -284,6 +290,7 @@ pub fn fetch_libc_from_docker_to(
     extra_libs: &[String],
 ) -> Result {
     let extra_libs = normalize_extra_libs(extra_libs)?;
+    check_libc_output(out_path, out_dir, arch, &extra_libs)?;
     docker_libc::extract_libc_files(image, arch, out_path, out_dir, &extra_libs)
         .context(DockerSnafu)
 }
@@ -408,7 +415,7 @@ pub(crate) fn fetch_libc_from_debian_selected_with(
         .cyan()
         .bold()
     )
-    .ok();
+    .context(SelectionOutputSnafu)?;
     let exact_snapshot_package =
         match snapshot_exact_version(short_version, exact_version, repo_url) {
             Some(exact) => match debian_libc::search_snapshot_binary(
@@ -451,6 +458,7 @@ pub(crate) fn fetch_libc_from_debian_selected_with(
     let package = &packages[choice];
     let ver = LibcVersion::from_parts(package.version.clone(), arch).context(VersionSnafu)?;
     let extra_libs = normalize_extra_libs(extra_libs)?;
+    check_libc_output(out_path, out_dir, arch, &extra_libs)?;
 
     fetch_libc_package_file_from_url_with(
         &ver,
@@ -619,6 +627,7 @@ pub(crate) fn fetch_libc_selected_with(
     let full_version = versions[choice].clone();
     let ver = LibcVersion::from_parts(full_version, arch).context(VersionSnafu)?;
     let extra_libs = normalize_extra_libs(extra_libs)?;
+    check_libc_output(out_path, out_dir, arch, &extra_libs)?;
 
     fetch_libc_package_file_with(&ver, LIBC_SONAME, out_path, pkg_base, policy, sleeper)?;
     let linker_out = out_dir.join(fetch_ld::canonical_ld_name(&ver.arch));
@@ -638,6 +647,9 @@ fn select_version(
     input: &mut dyn io::BufRead,
     output: &mut dyn io::Write,
 ) -> Result<usize> {
+    if versions.is_empty() {
+        return Err(Error::NoVersionsFound);
+    }
     let candidates = versions.join(", ");
     if let Some(exact) = exact_version {
         return versions
@@ -649,21 +661,21 @@ fn select_version(
             });
     }
     if versions.len() == 1 {
-        writeln!(output, "  {}", versions[0]).ok();
+        writeln!(output, "  {}", versions[0]).context(SelectionOutputSnafu)?;
         return Ok(0);
     }
     if non_interactive {
         return Err(Error::AmbiguousSelection { candidates });
     }
 
-    writeln!(output).ok();
+    writeln!(output).context(SelectionOutputSnafu)?;
     for (i, version) in versions.iter().enumerate() {
-        writeln!(output, "  [{}]  {}", i + 1, version).ok();
+        writeln!(output, "  [{}]  {}", i + 1, version).context(SelectionOutputSnafu)?;
     }
-    writeln!(output).ok();
+    writeln!(output).context(SelectionOutputSnafu)?;
     loop {
-        write!(output, "select version: ").ok();
-        output.flush().ok();
+        write!(output, "select version: ").context(SelectionOutputSnafu)?;
+        output.flush().context(SelectionOutputSnafu)?;
 
         let mut line = String::new();
         if input.read_line(&mut line).context(StdinSnafu)? == 0 {
@@ -680,8 +692,31 @@ fn select_version(
             "please enter a number between 1 and {}",
             versions.len()
         )
-        .ok();
+        .context(SelectionOutputSnafu)?;
     }
+}
+
+fn check_libc_output(
+    out_path: &Path,
+    out_dir: &Path,
+    arch: CpuArch,
+    extra_libs: &[&str],
+) -> Result {
+    let output = crate::opts::comparable_path(out_path);
+    let names = std::iter::once(fetch_ld::canonical_ld_name(&arch)).chain(
+        extra_libs
+            .iter()
+            .copied()
+            .filter(|name| *name != LIBC_SONAME),
+    );
+    for name in names {
+        if crate::opts::comparable_path(&out_dir.join(name)) == output {
+            return Err(Error::OutputCollision {
+                path: out_path.to_path_buf(),
+            });
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn normalize_extra_libs(extra_libs: &[String]) -> std::result::Result<Vec<&str>, Error> {

@@ -1,3 +1,4 @@
+use crate::artifact;
 use crate::debian_libc;
 use crate::elf;
 use crate::http_retry::{self, RetryPolicy, Sleeper, StdSleeper};
@@ -13,8 +14,6 @@ use snafu::ResultExt;
 use snafu::Snafu;
 use std::collections::HashSet;
 use std::io::copy;
-use std::io::stderr;
-use std::io::stdout;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
@@ -40,23 +39,33 @@ pub enum Error {
     ))]
     DebugSourcesFailed { target: String, errors: String },
 
-    #[snafu(display("failed creating temporary directory"))]
+    #[snafu(display("failed creating temporary directory: {}", source))]
     TmpDir { source: std::io::Error },
 
     #[snafu(display("failed running eu-unstrip, please install elfutils: {}", source))]
     CmdRun { source: std::io::Error },
 
-    #[snafu(display("eu-unstrip exited with failure: {}", status))]
-    CmdFail { status: ExitStatus },
+    #[snafu(display("eu-unstrip failed for {} ({}): {}", path.display(), status, stderr.trim()))]
+    CmdFail {
+        path: PathBuf,
+        status: ExitStatus,
+        stderr: String,
+    },
 
     #[snafu(display("failed to open symbol file: {}", source))]
     SymOpen { source: io::Error },
 
-    #[snafu(display("failed to open libc file: {}", source))]
-    LibcOpen { source: io::Error },
+    #[snafu(display("failed resolving libc file {}: {}", path.display(), source))]
+    LibcOpen {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 
-    #[snafu(display("failed writing symbols to libc file: {}", source))]
-    LibcWrite { source: std::io::Error },
+    #[snafu(display("failed writing symbols to {}: {}", path.display(), source))]
+    LibcWrite {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 
     #[snafu(display("failed scanning for local shared objects: {}", source))]
     ScanLibraries { source: std::io::Error },
@@ -168,22 +177,25 @@ fn do_unstrip_libc_with_sources(
         policy,
     )?;
 
+    let destination = std::fs::canonicalize(libc).context(LibcOpenSnafu { path: libc })?;
     let out = Command::new("eu-unstrip")
-        .arg(libc)
+        .arg("--")
+        .arg(&destination)
         .arg(&sym_path)
         .output()
         .context(CmdRunSnafu)?;
-    if !output::is_json() {
-        let _ = stderr().write_all(&out.stderr);
-        let _ = stdout().write_all(&out.stdout);
-    }
     if !out.status.success() {
-        return Err(Error::CmdFail { status: out.status });
+        return Err(Error::CmdFail {
+            path: libc.to_path_buf(),
+            status: out.status,
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        });
     }
+    output::command_output(&out);
 
     let mut sym_file = File::open(sym_path).context(SymOpenSnafu)?;
-    let mut libc_file = File::create(libc).context(LibcOpenSnafu)?;
-    copy(&mut sym_file, &mut libc_file).context(LibcWriteSnafu)?;
+    artifact::replace(&destination, |file| copy(&mut sym_file, file).map(|_| ()))
+        .context(LibcWriteSnafu { path: libc })?;
 
     Ok(())
 }
@@ -289,7 +301,8 @@ fn write_debuginfod_file_with(
     if bytes.is_empty() {
         return Err("debuginfod returned an empty response".to_string());
     }
-    std::fs::write(out_path, bytes).map_err(|err| format!("failed writing debuginfo: {}", err))
+    artifact::replace(out_path, |file| file.write_all(&bytes))
+        .map_err(|err| format!("failed writing debuginfo {}: {}", out_path.display(), err))
 }
 
 fn fetch_debug_symbols_with_sources(
@@ -324,7 +337,7 @@ fn fetch_debug_symbols_with_sources(
         };
         match result {
             Ok(()) => {
-                std::fs::copy(&out_path, sym_path).context(LibcWriteSnafu)?;
+                std::fs::copy(&out_path, sym_path).context(LibcWriteSnafu { path: sym_path })?;
                 output::progress(format!("using debug symbols from {}", name).green().bold());
                 return Ok(());
             }

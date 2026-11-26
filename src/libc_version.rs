@@ -47,6 +47,9 @@ pub enum Error {
     #[snafu(display("failed finding version string"))]
     NotFound,
 
+    #[snafu(display("invalid characters in libc version {:?}", version))]
+    InvalidVersion { version: String },
+
     #[snafu(display("invalid architecture: {}", source))]
     Arch { source: cpu_arch::Error },
 
@@ -61,6 +64,13 @@ impl LibcVersion {
     ///
     /// `version` should be the long form, e.g. `"2.31-0ubuntu9.9"`.
     pub fn from_parts(version: String, arch: CpuArch) -> Result<Self> {
+        if !version.as_bytes().first().is_some_and(u8::is_ascii_digit)
+            || !version
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b".-+~:".contains(&byte))
+        {
+            return Err(Error::InvalidVersion { version });
+        }
         let string_short = version
             .split('-')
             .next()
@@ -94,13 +104,8 @@ impl LibcVersion {
     pub fn detect(libc: &Path) -> Result<Self> {
         let bytes = fs::read(libc).context(ReadSnafu)?;
         let string = Self::version_string_from_bytes(&bytes)?;
-        let string_short = string.split('-').next().context(NotFoundSnafu)?.to_string();
-
-        Ok(Self {
-            string,
-            string_short,
-            arch: CpuArch::from_elf_bytes(libc, &bytes).context(ArchSnafu)?,
-        })
+        let arch = CpuArch::from_elf_bytes(libc, &bytes).context(ArchSnafu)?;
+        Self::from_parts(string, arch)
     }
 
     /// Extract the long version string from the bytes of a libc
@@ -139,5 +144,11 @@ mod tests {
         let version = LibcVersion::version_string_from_bytes(bytes).expect("Debian version");
 
         assert_eq!(version, "2.36-9+deb12u13");
+    }
+
+    #[test]
+    fn version_rejects_path_components() {
+        let err = LibcVersion::from_parts("2.36/../../file".into(), CpuArch::Amd64);
+        assert!(matches!(err, Err(Error::InvalidVersion { .. })));
     }
 }

@@ -1,5 +1,6 @@
 //! Utility functions that provide the bulk of `pwninit` functionality
 
+mod artifact;
 mod cpu_arch;
 mod debian_libc;
 mod docker_libc;
@@ -38,7 +39,6 @@ use crate::opts::{PwnOpts, RevOpts, SkipStep};
 pub use crate::set_exec::set_exec;
 pub use crate::unstrip_libc::unstrip_libc;
 use crate::warn::Warn;
-use crate::warn::WarnResult;
 
 use std::path::{Path, PathBuf};
 
@@ -79,12 +79,12 @@ fn path_name_starts_with(path: &Path, prefixes: &[&str]) -> bool {
 
 /// Detect if `path` is the provided libc
 pub fn is_libc(path: &Path) -> elf::detect::Result<bool> {
-    Ok(is_elf(path)? && path_name_starts_with(path, &["libc.", "libc-", "ld-musl"]))
+    Ok(path_name_starts_with(path, &["libc.", "libc-", "ld-musl"]) && is_elf(path)?)
 }
 
 /// Detect if `path` is the provided linker
 pub fn is_ld(path: &Path) -> elf::detect::Result<bool> {
-    Ok(is_elf(path)? && path_name_starts_with(path, &["ld-", "ld-linux", "ld-musl"]))
+    Ok(path_name_starts_with(path, &["ld-", "ld-linux", "ld-musl"]) && is_elf(path)?)
 }
 
 /// Same as `fetch_ld()`, but doesn't do anything if an existing linker is
@@ -129,6 +129,7 @@ fn missing_glibc_package_libraries(libs: impl IntoIterator<Item = String>) -> Ve
 }
 
 fn needed_libraries(bin: &Path) -> elf::parse::Result<Vec<String>> {
+    artifact::regular_file(bin).context(elf::parse::InspectSnafu { path: bin })?;
     let bytes = ex::fs::read(bin).context(elf::parse::ReadSnafu {
         path: bin.to_path_buf(),
     })?;
@@ -141,28 +142,6 @@ pub(crate) fn needed_glibc_libraries_result(opts: &PwnOpts) -> elf::parse::Resul
         return Ok(Vec::new());
     };
     needed_libraries(bin).map(missing_glibc_package_libraries)
-}
-
-pub(crate) fn needed_glibc_libraries(opts: &PwnOpts) -> Vec<String> {
-    match needed_glibc_libraries_result(opts) {
-        Ok(libs) => libs,
-        Err(err) => {
-            err.warn("failed detecting binary library dependencies");
-            Vec::new()
-        }
-    }
-}
-
-fn maybe_fetch_needed_libs(opts: &PwnOpts, ver: &LibcVersion) -> Vec<String> {
-    let mut failures = Vec::new();
-    for lib in needed_glibc_libraries(opts) {
-        if let Err(err) = fetch_libc::fetch_libc_lib(ver, &lib) {
-            let message = format!("failed fetching required libc companion {}: {}", lib, err);
-            output::warning(&message);
-            failures.push(message);
-        }
-    }
-    failures
 }
 
 fn maybe_unstrip_libc<F>(
@@ -205,41 +184,77 @@ fn detect_libc_family(libc: &Path) -> LibcFamily {
 /// Top-level function for libc-dependent tasks
 ///   1. Download linker if not found
 ///   2. Unstrip libc if libc is stripped
-fn visit_libc(opts: &PwnOpts, libc: &Path) -> Vec<String> {
-    let mut failures = Vec::new();
+fn visit_libc(opts: &PwnOpts, libc: &Path) -> Vec<output::Step> {
+    let mut steps = Vec::new();
     if detect_libc_family(libc) == LibcFamily::Musl {
-        output::progress(
+        steps.push(output::Step::skipped(
+            "prepare libc",
             format!(
-                "detected musl libc {}; skipping glibc-specific fetch/unstrip",
-                libc.to_string_lossy().bold()
-            )
-            .yellow(),
-        );
-        return failures;
+                "{} is musl; glibc downloads and debug symbols do not apply",
+                libc.display()
+            ),
+        ));
+        return steps;
     }
 
+    let needed = match needed_glibc_libraries_result(opts) {
+        Ok(needed) => needed,
+        Err(err) => {
+            steps.push(output::Step::failed(
+                "inspect binary dependencies",
+                err.to_string(),
+                true,
+            ));
+            Vec::new()
+        }
+    };
+    let version_required = opts.ld.is_none() || !needed.is_empty();
+    if !version_required && opts.skips(SkipStep::Unstrip) {
+        return steps;
+    }
     let ver = match LibcVersion::detect(libc) {
         Ok(ver) => ver,
         Err(err) => {
-            err.warn("failed detecting libc version (is the libc an Ubuntu glibc?)");
-            return failures;
+            steps.push(output::Step::failed(
+                "detect libc version",
+                format!("{}: {err}", libc.display()),
+                version_required,
+            ));
+            return steps;
         }
     };
-    if let Err(err) = maybe_fetch_ld(opts, &ver, fetch_ld) {
-        let message = format!("failed fetching linker: {}", err);
-        output::warning(&message);
-        failures.push(message);
+    if opts.ld.is_none() {
+        steps.push(match maybe_fetch_ld(opts, &ver, fetch_ld) {
+            Ok(()) => {
+                output::Step::completed("fetch linker", format!("downloaded linker for {ver}"))
+            }
+            Err(err) => output::Step::failed("fetch linker", err.to_string(), true),
+        });
     }
-    failures.extend(maybe_fetch_needed_libs(opts, &ver));
-    maybe_unstrip_libc(opts, libc, &ver, |libc, ver| {
-        unstrip_libc::unstrip_libc_shared_objects_from_source(libc, ver, opts.debug_source)
-    })
-    .warn("failed unstripping libc shared objects");
-    failures
+    for lib in needed {
+        steps.push(match fetch_libc::fetch_libc_lib(&ver, &lib) {
+            Ok(()) => output::Step::completed("fetch libc companion", lib),
+            Err(err) => output::Step::failed("fetch libc companion", format!("{lib}: {err}"), true),
+        });
+    }
+    if !opts.skips(SkipStep::Unstrip) {
+        steps.push(
+            match maybe_unstrip_libc(opts, libc, &ver, |libc, ver| {
+                unstrip_libc::unstrip_libc_shared_objects_from_source(libc, ver, opts.debug_source)
+            }) {
+                Ok(()) => output::Step::completed(
+                    "unstrip libc",
+                    format!("debug symbols available for {}", libc.display()),
+                ),
+                Err(err) => output::Step::failed("unstrip libc", err.to_string(), false),
+            },
+        );
+    }
+    steps
 }
 
 /// Same as `visit_libc()`, but doesn't do anything if no libc is found
-pub(crate) fn maybe_visit_libc_report(opts: &PwnOpts) -> Vec<String> {
+pub(crate) fn maybe_visit_libc_report(opts: &PwnOpts) -> Vec<output::Step> {
     if let Some(libc) = &opts.libc {
         visit_libc(opts, libc)
     } else {
@@ -248,7 +263,11 @@ pub(crate) fn maybe_visit_libc_report(opts: &PwnOpts) -> Vec<String> {
 }
 
 pub fn maybe_visit_libc(opts: &PwnOpts) {
-    let _ = maybe_visit_libc_report(opts);
+    for step in maybe_visit_libc_report(opts) {
+        if matches!(step.status, output::StepStatus::Failed) {
+            step.detail.warn(&step.name);
+        }
+    }
 }
 
 fn set_exec_if_needed(

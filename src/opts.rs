@@ -1,5 +1,6 @@
 //! Command-line option handling
 
+use crate::artifact;
 use crate::cpu_arch::CpuArch;
 use crate::elf;
 use crate::is_bin;
@@ -76,7 +77,6 @@ pub enum DebugSource {
     Debian,
 }
 
-
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("ELF detection error: {}", source))]
@@ -113,6 +113,16 @@ pub enum Error {
     ))]
     MissingInitramfs,
 
+    #[snafu(display("failed inspecting {} input {}: {}", kind, path.display(), source))]
+    Input {
+        kind: &'static str,
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    #[snafu(display("solve script output {} resolves to the {} input", path.display(), kind))]
+    SolvePathConflict { path: PathBuf, kind: &'static str },
+
     #[snafu(display("debug initramfs path must differ from the original initramfs"))]
     DebugInitramfsConflict,
 
@@ -130,26 +140,6 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
-
-pub(crate) fn fold_current_dir<T, F>(init: T, mut merge: F) -> Result<T>
-where
-    F: FnMut(T, fs::DirEntry) -> elf::detect::Result<T>,
-{
-    fs::read_dir(".")
-        .context(ReadDirSnafu)?
-        .try_fold(init, |acc, dir_ent| {
-            let dir_ent = dir_ent.context(DirEntSnafu)?;
-            merge(acc, dir_ent).context(ElfDetectSnafu)
-        })
-}
-
-fn detect_path_if(
-    dir_ent: &fs::DirEntry,
-    pred: fn(&Path) -> elf::detect::Result<bool>,
-) -> elf::detect::Result<Option<PathBuf>> {
-    let path = dir_ent.path();
-    Ok(if pred(&path)? { Some(path) } else { None })
-}
 
 const ROOT_EXAMPLES: &str = "\
 Examples:
@@ -800,7 +790,7 @@ impl PwnOpts {
         if self.ld.is_some() {
             return Ok(self);
         }
-        let detected = scan_current_dir()?;
+        let detected = scan_current_dir(false, false, true)?;
         Ok(self.with_ld(select_candidate("linker", detected.ld)?))
     }
 }
@@ -831,19 +821,24 @@ struct DetectedKernelPaths {
     run_script: Vec<PathBuf>,
 }
 
-fn scan_current_dir() -> Result<DetectedPaths> {
-    fold_current_dir(DetectedPaths::default(), |mut found, dir_ent| {
-        if let Some(path) = detect_path_if(&dir_ent, is_bin)? {
-            found.bin.push(path);
+fn scan_current_dir(need_bin: bool, need_libc: bool, need_ld: bool) -> Result<DetectedPaths> {
+    let mut found = DetectedPaths::default();
+    if !need_bin && !need_libc && !need_ld {
+        return Ok(found);
+    }
+    for dir_ent in fs::read_dir(".").context(ReadDirSnafu)? {
+        let path = dir_ent.context(DirEntSnafu)?.path();
+        if need_bin && is_bin(&path).context(ElfDetectSnafu)? {
+            found.bin.push(path.clone());
         }
-        if let Some(path) = detect_path_if(&dir_ent, is_libc)? {
-            found.libc.push(path);
+        if need_libc && is_libc(&path).context(ElfDetectSnafu)? {
+            found.libc.push(path.clone());
         }
-        if let Some(path) = detect_path_if(&dir_ent, is_ld)? {
+        if need_ld && is_ld(&path).context(ElfDetectSnafu)? {
             found.ld.push(path);
         }
-        Ok(found)
-    })
+    }
+    Ok(found)
 }
 
 fn scan_kernel_current_dir(
@@ -952,7 +947,7 @@ fn select_candidate(kind: &'static str, mut candidates: Vec<PathBuf>) -> Result<
 }
 
 fn resolve_pwn(mut opts: PwnOpts) -> Result<PwnOpts> {
-    let detected = scan_current_dir()?;
+    let detected = scan_current_dir(opts.bin.is_none(), opts.libc.is_none(), opts.ld.is_none())?;
     if opts.bin.is_none() {
         opts.bin = select_candidate("binary", detected.bin)?;
     }
@@ -965,17 +960,54 @@ fn resolve_pwn(mut opts: PwnOpts) -> Result<PwnOpts> {
     if opts.bin.is_none() {
         return Err(Error::MissingBinary);
     }
+    resolve_user_files(
+        &[
+            ("binary", opts.bin.as_deref()),
+            ("libc", opts.libc.as_deref()),
+            ("linker", opts.ld.as_deref()),
+            ("template", opts.template_path.as_deref()),
+        ],
+        (!opts.skips(SkipStep::Template)).then_some(opts.solve_path.as_path()),
+    )?;
     Ok(opts)
 }
 
 fn resolve_rev(mut opts: RevOpts) -> Result<RevOpts> {
     if opts.bin.is_none() {
-        opts.bin = select_candidate("binary", scan_current_dir()?.bin)?;
+        opts.bin = select_candidate("binary", scan_current_dir(true, false, false)?.bin)?;
     }
     if opts.bin.is_none() {
         return Err(Error::MissingBinary);
     }
+    resolve_user_files(
+        &[
+            ("binary", opts.bin.as_deref()),
+            ("template", opts.template_path.as_deref()),
+        ],
+        (!opts.skips(SkipStep::Template)).then_some(opts.solve_path.as_path()),
+    )?;
     Ok(opts)
+}
+
+fn resolve_user_files(
+    inputs: &[(&'static str, Option<&Path>)],
+    solve: Option<&Path>,
+) -> Result<()> {
+    let solve = solve.map(comparable_path);
+    for &(kind, path) in inputs {
+        let Some(path) = path else { continue };
+        artifact::regular_file(path).context(InputSnafu { kind, path })?;
+        if solve
+            .as_ref()
+            .is_some_and(|solve| *solve == comparable_path(path))
+        {
+            return Err(Error::SolvePathConflict {
+                path: path.to_path_buf(),
+                kind,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn resolve_kernel(mut opts: KernelOpts) -> Result<KernelOpts> {
@@ -1048,10 +1080,22 @@ fn kernel_path_conflict(opts: &KernelOpts) -> Option<(&'static str, &'static str
             }
         }
     }
+    let rootfs = comparable_path(&opts.rootfs_dir);
+    for (label, path) in &paths[..5] {
+        if let Some(path) = path {
+            let path = comparable_path(path);
+            if path.starts_with(&rootfs) {
+                return Some(("--rootfs-dir", label, path));
+            }
+        }
+    }
     None
 }
 
-fn comparable_path(path: &Path) -> PathBuf {
+pub(crate) fn comparable_path(path: &Path) -> PathBuf {
+    if let Ok(resolved) = std::fs::canonicalize(path) {
+        return resolved;
+    }
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {

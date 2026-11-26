@@ -53,15 +53,7 @@ pub fn is_bzimage(bytes: &[u8]) -> bool {
 }
 
 pub fn is_kernel_image(path: &Path) -> bool {
-    let Ok(mut file) = std::fs::File::open(path) else {
-        return false;
-    };
-    let mut prefix = vec![0; SETUP_MAGIC_OFFSET + 4];
-    let Ok(size) = file.read(&mut prefix) else {
-        return false;
-    };
-    prefix.truncate(size);
-    is_bzimage(&prefix) || is_x86_64_elf_header(&prefix)
+    inspect(path).is_ok()
 }
 
 pub fn extract_vmlinux_bytes(image: &[u8]) -> Option<Vec<u8>> {
@@ -88,16 +80,17 @@ pub fn extract_vmlinux_bytes(image: &[u8]) -> Option<Vec<u8>> {
 }
 
 pub fn inspect(path: &Path) -> Result<()> {
-    let mut file = std::fs::File::open(path).map_err(|source| Error::Read {
+    let read_error = |source| Error::Read {
         path: path.to_path_buf(),
         source,
-    })?;
-    let mut prefix = vec![0; SETUP_MAGIC_OFFSET + 4];
-    let size = file.read(&mut prefix).map_err(|source| Error::Read {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    prefix.truncate(size);
+    };
+    crate::artifact::regular_file(path).map_err(read_error)?;
+    let mut prefix = Vec::with_capacity(SETUP_MAGIC_OFFSET + 4);
+    std::fs::File::open(path)
+        .map_err(read_error)?
+        .take((SETUP_MAGIC_OFFSET + 4) as u64)
+        .read_to_end(&mut prefix)
+        .map_err(read_error)?;
     if is_bzimage(&prefix) || is_x86_64_elf_header(&prefix) {
         Ok(())
     } else {

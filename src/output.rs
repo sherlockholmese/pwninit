@@ -1,3 +1,4 @@
+use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -113,7 +114,10 @@ pub fn configure(quiet: bool, verbose: u8, json_mode: bool) {
     if quiet || json_mode {
         colored::control::set_override(false);
     }
-    warnings().lock().expect("warnings lock").clear();
+    warnings()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .clear();
 }
 
 fn warnings() -> &'static Mutex<Vec<String>> {
@@ -150,7 +154,7 @@ pub fn download_progress(url: &str, total: Option<u64>) -> ProgressBar {
             ProgressStyle::with_template(
                 "{msg:.green} [{bar:30.cyan/blue}] {bytes}/{total_bytes} {bytes_per_sec}",
             )
-            .expect("valid download progress template")
+            .unwrap_or_else(|_| ProgressStyle::default_bar())
             .progress_chars("=>-"),
         ),
         None => {
@@ -158,7 +162,7 @@ pub fn download_progress(url: &str, total: Option<u64>) -> ProgressBar {
                 ProgressStyle::with_template(
                     "{spinner:.green} {msg:.green} {bytes} {bytes_per_sec}",
                 )
-                .expect("valid download spinner template"),
+                .unwrap_or_else(|_| ProgressStyle::default_spinner()),
             );
             bar.enable_steady_tick(Duration::from_millis(100));
             bar
@@ -170,43 +174,66 @@ pub fn download_progress(url: &str, total: Option<u64>) -> ProgressBar {
 
 pub fn progress(message: impl std::fmt::Display) {
     if !QUIET.load(Ordering::Relaxed) && !is_json() {
-        println!("{message}");
+        let _ = writeln!(io::stdout().lock(), "{message}");
     }
 }
 
 pub fn verbose(message: impl std::fmt::Display) {
     if VERBOSE.load(Ordering::Relaxed) > 0 && !is_json() {
-        eprintln!("{message}");
+        let _ = writeln!(io::stderr().lock(), "{message}");
+    }
+}
+
+pub(crate) fn command_output(result: &std::process::Output) {
+    if !is_json() {
+        let _ = io::stdout().lock().write_all(&result.stdout);
+        let _ = io::stderr().lock().write_all(&result.stderr);
     }
 }
 
 pub fn warning(message: impl Into<String>) {
     let message = message.into();
     if is_json() {
-        warnings().lock().expect("warnings lock").push(message);
+        warnings()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .push(message);
     } else {
-        eprintln!("{}", format!("warning: {message}").magenta().bold());
+        let _ = writeln!(
+            io::stderr().lock(),
+            "{}",
+            format!("warning: {message}").magenta().bold()
+        );
     }
 }
 
-pub fn error(message: impl AsRef<str>) {
+pub fn error(message: impl AsRef<str>) -> io::Result<()> {
     if is_json() {
-        println!(
+        writeln!(
+            io::stdout().lock(),
             "{}",
             json!({
                 "success": false,
                 "error": message.as_ref(),
-                "warnings": warnings().lock().expect("warnings lock").clone(),
+                "warnings": warnings().lock().unwrap_or_else(|err| err.into_inner()).clone(),
             })
-        );
+        )
     } else {
-        eprintln!("{}", format!("error: {}", message.as_ref()).red().bold());
+        writeln!(
+            io::stderr().lock(),
+            "{}",
+            format!("error: {}", message.as_ref()).red().bold()
+        )
     }
 }
 
-pub fn render_summary(summary: &Summary) {
+pub fn render_summary(summary: &Summary) -> io::Result<()> {
+    let mut stdout = io::stdout().lock();
     if is_json() {
-        let warnings = warnings().lock().expect("warnings lock").clone();
+        let warnings = warnings()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone();
         let steps = summary
             .steps
             .iter()
@@ -219,7 +246,8 @@ pub fn render_summary(summary: &Summary) {
                 })
             })
             .collect::<Vec<_>>();
-        println!(
+        return writeln!(
+            stdout,
             "{}",
             json!({
                 "command": summary.command,
@@ -229,17 +257,16 @@ pub fn render_summary(summary: &Summary) {
                 "warnings": warnings,
             })
         );
-        return;
     }
 
     let dry_run = summary.dry_run;
 
     if !QUIET.load(Ordering::Relaxed) {
-        println!();
+        writeln!(stdout)?;
         if dry_run {
-            println!("{}", "plan (dry run, nothing was changed)".bold());
+            writeln!(stdout, "{}", "plan (dry run, nothing was changed)".bold())?;
         } else {
-            println!("{}", "summary".bold());
+            writeln!(stdout, "{}", "summary".bold())?;
         }
         for step in &summary.steps {
             let marker = match step.status {
@@ -248,11 +275,11 @@ pub fn render_summary(summary: &Summary) {
                 StepStatus::Failed => "✗".red(),
                 StepStatus::Planned => "→".cyan(),
             };
-            println!("{} {}: {}", marker, step.name, step.detail);
+            writeln!(stdout, "{} {}: {}", marker, step.name, step.detail)?;
         }
         if dry_run {
-            println!();
-            println!("Run again without --dry-run to apply.");
+            writeln!(stdout)?;
+            writeln!(stdout, "Run again without --dry-run to apply.")?;
         }
     } else if dry_run {
         let planned = summary
@@ -260,8 +287,14 @@ pub fn render_summary(summary: &Summary) {
             .iter()
             .filter(|step| matches!(step.status, StepStatus::Planned))
             .count();
-        println!("planned: {planned} (dry run)");
+        writeln!(stdout, "planned: {planned} (dry run)")?;
     } else {
+        let mut stderr = io::stderr().lock();
+        for step in &summary.steps {
+            if step.required && matches!(step.status, StepStatus::Failed) {
+                let _ = writeln!(stderr, "error: {}: {}", step.name, step.detail);
+            }
+        }
         let completed = summary
             .steps
             .iter()
@@ -277,8 +310,12 @@ pub fn render_summary(summary: &Summary) {
             .iter()
             .filter(|step| matches!(step.status, StepStatus::Failed))
             .count();
-        println!("completed: {completed}, skipped: {skipped}, failed: {failed}");
+        writeln!(
+            stdout,
+            "completed: {completed}, skipped: {skipped}, failed: {failed}"
+        )?;
     }
+    stdout.flush()
 }
 
 #[cfg(test)]

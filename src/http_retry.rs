@@ -37,6 +37,8 @@ use snafu::Snafu;
 
 use crate::output;
 
+const MAX_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
+
 /// Return `true` for HTTP statuses that are safe to retry: `408`,
 /// `429`, and any `5xx`.
 ///
@@ -67,6 +69,9 @@ pub enum Error {
 
     #[snafu(display("HTTP request returned retryable status: {}", status))]
     RetryableStatus { status: reqwest::StatusCode },
+
+    #[snafu(display("HTTP response exceeds the {} MiB download limit", MAX_RESPONSE_BYTES / 1024 / 1024))]
+    BodyTooLarge,
 
     #[snafu(display("failed to parse response body: {}", message))]
     Parse { message: String },
@@ -211,10 +216,15 @@ fn transfer_client() -> Result<Client> {
 struct ProgressWriter {
     bytes: Vec<u8>,
     progress: ProgressBar,
+    limit_exceeded: bool,
 }
 
 impl Write for ProgressWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.len() > MAX_RESPONSE_BYTES - self.bytes.len() {
+            self.limit_exceeded = true;
+            return Err(io::Error::other("HTTP response exceeds download limit"));
+        }
         self.bytes.extend_from_slice(buf);
         self.progress.inc(buf.len() as u64);
         Ok(buf.len())
@@ -225,18 +235,27 @@ impl Write for ProgressWriter {
     }
 }
 
-fn read_response_body(
-    mut response: reqwest::blocking::Response,
-    url: &str,
-) -> reqwest::Result<Vec<u8>> {
+fn read_response_body(mut response: reqwest::blocking::Response, url: &str) -> Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+    {
+        return Err(Error::BodyTooLarge);
+    }
     let progress = output::download_progress(url, response.content_length());
     let mut writer = ProgressWriter {
         bytes: Vec::new(),
         progress,
+        limit_exceeded: false,
     };
     let result = response.copy_to(&mut writer);
     writer.progress.finish_and_clear();
-    result.map(|_| writer.bytes)
+    if writer.limit_exceeded {
+        return Err(Error::BodyTooLarge);
+    }
+    result
+        .map(|_| writer.bytes)
+        .map_err(|source| Error::Request { source })
 }
 
 fn request_bytes(
@@ -268,7 +287,8 @@ fn request_bytes(
         if status.is_success() {
             match read_response_body(resp, url) {
                 Ok(bytes) => RetryOutcome::Success(bytes),
-                Err(source) => RetryOutcome::Transient(Error::Request { source }),
+                Err(err @ Error::Request { .. }) => RetryOutcome::Transient(err),
+                Err(err) => RetryOutcome::Permanent(err),
             }
         } else if is_retryable_status(status) {
             RetryOutcome::Transient(Error::RetryableStatus { status })
@@ -575,6 +595,7 @@ mod tests {
         let mut writer = ProgressWriter {
             bytes: Vec::new(),
             progress: progress.clone(),
+            limit_exceeded: false,
         };
 
         writer.write_all(b"downloaded bytes").expect("write bytes");

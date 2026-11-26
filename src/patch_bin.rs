@@ -1,3 +1,4 @@
+use crate::artifact;
 use crate::opts::{PatchMode, PwnOpts};
 use crate::output;
 use crate::warn::Warn;
@@ -10,7 +11,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, ExitStatus};
 
 use colored::Colorize;
 use goblin::elf::dynamic::DT_NEEDED;
@@ -24,8 +25,12 @@ use snafu::Snafu;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("patchelf failed with nonzero exit status"))]
-    Patchelf,
+    #[snafu(display("patchelf {} failed ({}): {}", option, status, stderr.trim()))]
+    Patchelf {
+        option: String,
+        status: ExitStatus,
+        stderr: String,
+    },
 
     #[snafu(display("patchelf failed to start; please install patchelf: {}", source))]
     PatchelfExec { source: io::Error },
@@ -215,9 +220,10 @@ fn dynstr_file_offset(elf: &Elf) -> Option<usize> {
     for phdr in &elf.program_headers {
         if phdr.p_type == PT_LOAD {
             let seg_start = phdr.p_vaddr as usize;
-            let seg_end = seg_start + phdr.p_filesz as usize;
-            if vaddr >= seg_start && vaddr < seg_end {
-                return Some(phdr.p_offset as usize + (vaddr - seg_start));
+            if let Some(relative) = vaddr.checked_sub(seg_start) {
+                if relative < phdr.p_filesz as usize {
+                    return (phdr.p_offset as usize).checked_add(relative);
+                }
             }
         }
     }
@@ -242,7 +248,11 @@ fn collect_manual_targets(
         if let Some(ld) = local_libs.get("ld") {
             let offset = interp_hdr.p_offset as usize;
             let slot_len = interp_hdr.p_filesz as usize;
-            if offset + slot_len > bytes.len() || slot_len == 0 {
+            if offset
+                .checked_add(slot_len)
+                .is_none_or(|end| end > bytes.len())
+                || slot_len == 0
+            {
                 return Err(Error::InvalidOffset {
                     path: bin_patched.to_path_buf(),
                     offset,
@@ -326,7 +336,11 @@ fn apply_in_place_patch(bytes: &mut [u8], target: &PatchTarget) -> bool {
         return false;
     }
 
-    if target.offset + target.slot_len > bytes.len() {
+    if target
+        .offset
+        .checked_add(target.slot_len)
+        .is_none_or(|end| end > bytes.len())
+    {
         format!("offset {} is out of file bounds", target.offset).warn("skipping patch target");
         return false;
     }
@@ -347,7 +361,7 @@ fn make_symlink(link: &Path, target: &Path) -> Result<()> {
     match fs::symlink_metadata(link) {
         Ok(meta) => {
             if meta.file_type().is_symlink() {
-                if fs::read_link(link).ok().as_deref() == Some(target) {
+                if fs::read_link(link).context(SymlinkSnafu { link, target })? == target {
                     return Ok(());
                 }
                 fs::remove_file(link).context(RemoveLinkSnafu {
@@ -433,15 +447,20 @@ fn patch_manually(bin_patched: &Path, opts: &PwnOpts) -> Result<()> {
 
 /// Run `patchelf` on the binary `bin` using the option `option` with the path `argument`.
 fn run_patchelf_option(bin: &Path, option: &str, argument: &PathBuf) -> Result<()> {
-    let mut cmd = Command::new("patchelf");
-    cmd.arg(bin);
-    cmd.arg(option).arg(argument);
-
-    let status = cmd.status().context(PatchelfExecSnafu)?;
-    if status.success() {
+    let result = Command::new("patchelf")
+        .arg(option)
+        .arg(argument)
+        .arg(bin)
+        .output()
+        .context(PatchelfExecSnafu)?;
+    if result.status.success() {
         Ok(())
     } else {
-        Err(Error::Patchelf)
+        Err(Error::Patchelf {
+            option: option.to_string(),
+            status: result.status,
+            stderr: String::from_utf8_lossy(&result.stderr).into_owned(),
+        })
     }
 }
 
@@ -484,34 +503,21 @@ pub fn bin_patched_path(opts: &PwnOpts) -> Option<PathBuf> {
     }
 }
 
-/// Copy the file `bin` to a file with "_patched" appended to the file name.
-/// Return the path to the new file.
-fn copy_patched(bin: &Path) -> Result<PathBuf> {
-    let bin_patched = bin_patched_path_from_bin(bin)?;
-    output::progress(
-        format!(
-            "copying {} to {}",
-            bin.to_string_lossy().bold(),
-            bin_patched.to_string_lossy().bold()
-        )
-        .green(),
-    );
-    fs::copy(bin, &bin_patched).context(CopyPatchedSnafu)?;
-
-    Ok(bin_patched)
-}
-
 /// If `opts` has a binary, patch its RPATH and interpreter.
 ///
 /// Specifically, symlink "libc.so.6" to the libc,
 /// copy the binary,
 /// and run patchelf on the copied binary.
 pub fn patch_bin(opts: &PwnOpts) -> Result<()> {
-    if let Some(bin) = &opts.bin {
-        let bin_patched = copy_patched(bin)?;
+    if let (Some(bin), Some(mode)) = (&opts.bin, opts.resolved_patch_mode()) {
+        let destination = bin_patched_path_from_bin(bin)?;
+        let staging = tempfile::tempdir_in(artifact::parent(&destination))
+            .context(WritePatchedSnafu { path: &destination })?;
+        let bin_patched = staging.path().join("binary");
+        fs::copy(bin, &bin_patched).context(CopyPatchedSnafu)?;
 
-        match opts.resolved_patch_mode() {
-            Some(PatchMode::Patchelf) => {
+        match mode {
+            PatchMode::Patchelf => {
                 if let Some(libc) = &opts.libc {
                     symlink_libc(libc)?;
                     ensure_symlink("libc", libc)?;
@@ -521,11 +527,11 @@ pub fn patch_bin(opts: &PwnOpts) -> Result<()> {
                 }
                 patch_with_patchelf(&bin_patched, opts)?;
             }
-            Some(PatchMode::Manual) => {
+            PatchMode::Manual => {
                 patch_manually(&bin_patched, opts)?;
             }
-            None => {}
         }
+        fs::rename(&bin_patched, &destination).context(WritePatchedSnafu { path: destination })?;
     }
 
     Ok(())

@@ -3,17 +3,16 @@ use std::io::copy;
 use std::io::Cursor;
 use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use colored::Colorize;
-use ex::fs::File;
-use ex::io;
 use flate2::read::GzDecoder;
 use snafu::OptionExt;
 use snafu::ResultExt;
 use snafu::Snafu;
 use xz2::read::XzDecoder;
 
+use crate::artifact;
 use crate::http_retry::{self, RetryPolicy, Sleeper, StdSleeper};
 use crate::output;
 
@@ -22,38 +21,22 @@ pub const PKG_URL: &str = "https://launchpad.net/ubuntu/+archive/primary/+files"
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-fn tar_entry_matches_any<R: Read>(
-    entry: &std::io::Result<tar::Entry<R>>,
-    file_names: &[&str],
-) -> bool {
-    let Ok(entry) = entry else { return false };
-    let Ok(path) = entry.path() else { return false };
-
-    let matched = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(|name| file_names.contains(&name))
-        .unwrap_or(false);
-    if matched {
-        output::progress(
-            format!("Found matching file: {}", path.display())
-                .bold()
-                .green(),
-        );
-    }
-    matched
-}
-
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("failed to download package from Ubuntu mirror: {}", source))]
+    #[snafu(display("failed to download package: {}", source))]
     Download { source: reqwest::Error },
 
-    #[snafu(display(
-        "failed to download package from Ubuntu mirror: status code: {}",
-        status
-    ))]
-    DownloadStatus { status: reqwest::StatusCode },
+    #[snafu(display("failed to download package {}: status code: {}", url, status))]
+    DownloadStatus {
+        url: String,
+        status: reqwest::StatusCode,
+    },
+
+    #[snafu(display("failed to read package response: {}", source))]
+    DownloadBody { source: http_retry::Error },
+
+    #[snafu(display("failed reading Debian package {}: {}", url, source))]
+    Archive { url: String, source: std::io::Error },
 
     #[snafu(display("failed decompressing data.tar.zst: {}", source))]
     DataUnzipZstd { source: std::io::Error },
@@ -67,11 +50,11 @@ pub enum Error {
     #[snafu(display("failed reading file entry in data.tar: {}", source))]
     Read { source: std::io::Error },
 
-    #[snafu(display("failed to write file from deb: {}", source))]
-    Write { source: std::io::Error },
-
-    #[snafu(display("failed to create file: {}", source))]
-    Create { source: io::Error },
+    #[snafu(display("failed writing package file {}: {}", path.display(), source))]
+    Write {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 
     #[snafu(display("failed to find data.tar in package"))]
     DataNotFound,
@@ -129,24 +112,26 @@ pub(crate) fn write_deb_url_file_with<P: AsRef<Path>>(
 ) -> Result<()> {
     let out_path = out_path.as_ref();
 
-    let deb_bytes = match http_retry::get_bytes(&url, policy, sleeper) {
+    let deb_bytes = match http_retry::get_bytes(url, policy, sleeper) {
         Ok((bytes, _trace)) => bytes,
         Err(http_retry::Error::Request { source }) => {
             return Err(Error::Download { source });
         }
         Err(http_retry::Error::PermanentStatus { status })
         | Err(http_retry::Error::RetryableStatus { status }) => {
-            return Err(Error::DownloadStatus { status });
+            return Err(Error::DownloadStatus {
+                url: url.to_string(),
+                status,
+            });
         }
-        // `get_bytes` reads the body and never parses JSON, so the `Parse`
-        // variant is unreachable for the package download surface.
-        Err(http_retry::Error::Parse { .. }) => unreachable!(),
+        Err(source) => return Err(Error::DownloadBody { source }),
     };
 
     let mut deb = ar::Archive::new(Cursor::new(deb_bytes));
 
     // Try to find data.tar in package
-    while let Some(Ok(entry)) = deb.next_entry() {
+    while let Some(entry) = deb.next_entry() {
+        let entry = entry.context(ArchiveSnafu { url })?;
         let path = entry.header().identifier();
         let path = Path::new(OsStr::from_bytes(path));
 
@@ -190,15 +175,36 @@ fn write_ubuntu_data_tar_file<R: Read>(
     out_path: &Path,
 ) -> Result<()> {
     let mut data_tar = tar::Archive::new(data_tar_bytes);
-    let mut entry = data_tar
-        .entries()
-        .context(DataEntriesSnafu)?
-        .find(|entry| tar_entry_matches_any(entry, file_names))
-        .context(FileNotFoundSnafu)?
-        .context(ReadSnafu)?;
-    let mut out_file = File::create(out_path).context(CreateSnafu)?;
-    copy(&mut entry, &mut out_file).context(WriteSnafu)?;
-    Ok(())
+    for entry in data_tar.entries().context(DataEntriesSnafu)? {
+        let mut entry = entry.context(ReadSnafu)?;
+        let path = entry.path().context(ReadSnafu)?;
+        if !entry.header().entry_type().is_file()
+            || !path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| file_names.contains(&name))
+        {
+            continue;
+        }
+        output::progress(
+            format!("found matching file: {}", path.display())
+                .bold()
+                .green(),
+        );
+        let expected = entry.size();
+        return artifact::replace(out_path, |file| {
+            if copy(&mut entry, file)? == expected {
+                Ok(())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "truncated package entry",
+                ))
+            }
+        })
+        .context(WriteSnafu { path: out_path });
+    }
+    Err(Error::FileNotFound)
 }
 
 #[cfg(test)]
@@ -600,7 +606,7 @@ mod tests {
 
         assert_eq!(sleeper.sleeps.len() as u32, policy.max_attempts - 1);
         match err {
-            Error::DownloadStatus { status } => {
+            Error::DownloadStatus { status, .. } => {
                 assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
             }
             other => panic!("expected DownloadStatus(503), got {:?}", other),
@@ -642,7 +648,7 @@ mod tests {
                 permanent
             );
             match err {
-                Error::DownloadStatus { status } => {
+                Error::DownloadStatus { status, .. } => {
                     assert_eq!(
                         status.as_u16(),
                         permanent,
@@ -689,9 +695,7 @@ mod tests {
             sleeper.sleeps.is_empty(),
             "malformed package content must not retry"
         );
-        // The ar reader returns `None` for `next_entry` on a non-ar body,
-        // which the extraction code maps to `DataNotFound`.
-        assert!(matches!(err, Error::DataNotFound));
+        assert!(matches!(err, Error::Archive { .. }));
         assert_eq!(server.remaining(), 0);
     }
 
@@ -749,6 +753,23 @@ mod tests {
         assert!(sleeper.sleeps.is_empty(), "missing file must not retry");
         assert!(matches!(err, Error::FileNotFound));
         assert_eq!(server.remaining(), 0);
+    }
+
+    #[test]
+    fn truncated_tar_entry_preserves_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_path = dir.path().join("libc.so.6");
+        std::fs::write(&out_path, b"existing").unwrap();
+        let mut header = tar::Header::new_gnu();
+        header.set_path("libc.so.6").unwrap();
+        header.set_size(50);
+        header.set_cksum();
+        let mut tar = header.as_bytes().to_vec();
+        tar.extend_from_slice(b"truncated");
+        let err = write_ubuntu_data_tar_file(tar.as_slice(), &["libc.so.6"], &out_path)
+            .expect_err("truncated content must fail");
+        assert!(matches!(err, Error::Write { .. }));
+        assert_eq!(std::fs::read(out_path).unwrap(), b"existing");
     }
 
     // --------------------------------------------------------------------

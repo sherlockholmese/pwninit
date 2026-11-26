@@ -9,6 +9,12 @@ use snafu::Snafu;
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum Error {
+    #[snafu(display("could not inspect {}: {}", path.display(), source))]
+    Inspect {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
     #[snafu(display("could not read {}: {}", path.display(), source))]
     Read { source: io::Error, path: PathBuf },
     #[snafu(display("could not parse {}: {}", path.display(), source))]

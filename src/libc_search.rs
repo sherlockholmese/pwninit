@@ -11,24 +11,27 @@ use snafu::Snafu;
 pub(crate) const LAUNCHPAD_API_BASE: &str = "https://api.launchpad.net/1.0/ubuntu/+archive/primary";
 const LAUNCHPAD_PAGE_SIZE: &str = "300";
 
-fn launchpad_api_url_with_base(base: &str) -> String {
-    let mut url = reqwest::Url::parse(base).expect("Launchpad API URL is valid");
+fn launchpad_api_url_with_base(base: &str) -> Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(base).map_err(|err| Error::InvalidUrl {
+        message: err.to_string(),
+    })?;
     url.query_pairs_mut()
         .append_pair("ws.op", "getPublishedBinaries")
         .append_pair("binary_name", "libc6")
         .append_pair("exact_match", "true")
         .append_pair("status", "Published")
         .append_pair("ws.size", LAUNCHPAD_PAGE_SIZE);
-    url.to_string()
-}
-
-#[allow(dead_code)]
-fn launchpad_api_url() -> String {
-    launchpad_api_url_with_base(LAUNCHPAD_API_BASE)
+    Ok(url)
 }
 
 #[derive(Debug, Snafu)]
 pub enum Error {
+    #[snafu(display("invalid Launchpad API URL: {}", message))]
+    InvalidUrl { message: String },
+
+    #[snafu(display("Launchpad API returned a repeated pagination link"))]
+    PaginationLoop,
+
     #[snafu(display("failed to query Launchpad API: {}", source))]
     Request { source: http_retry::Error },
 
@@ -88,9 +91,13 @@ pub(crate) fn search_versions_with(
     let arch_str = arch.to_string();
     let prefix = format!("{}-", short_version);
     let mut versions: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut url: Option<String> = Some(launchpad_api_url_with_base(api_base));
+    let mut url = Some(launchpad_api_url_with_base(api_base)?.to_string());
+    let mut visited = std::collections::HashSet::new();
 
     while let Some(next_url) = url {
+        if !visited.insert(next_url.clone()) {
+            return Err(Error::PaginationLoop);
+        }
         let (page, _trace): (Page, _) =
             http_retry::get_json(&next_url, policy, sleeper).map_err(map_retry_error)?;
 
